@@ -41,6 +41,8 @@ class LSMTree {
   void put(const std::string& key, const std::string& value);
   void erase(const std::string& key);
   std::optional<std::string> get(const std::string& key) const;
+  std::vector<std::pair<std::string, std::string>> scan(
+      const std::string& begin, const std::string& end) const;
 
   void flush();
   void compact();

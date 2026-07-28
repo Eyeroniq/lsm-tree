@@ -501,6 +501,44 @@ std::optional<std::string> LSMTree::get(const std::string& key) const {
   return std::nullopt;
 }
 
+std::vector<std::pair<std::string, std::string>> LSMTree::scan(
+    const std::string& begin, const std::string& end) const {
+  if (end < begin) {
+    throw std::invalid_argument("scan end precedes begin");
+  }
+  std::map<std::string, Entry> latest;
+  for (const auto& table : tables_) {
+    for (const auto& [key, entry] : table->entries) {
+      if (key < begin || (!end.empty() && key >= end)) {
+        continue;
+      }
+      const auto current = latest.find(key);
+      if (current == latest.end() ||
+          current->second.sequence < entry.sequence) {
+        latest[key] = entry;
+      }
+    }
+  }
+  for (auto iterator = memtable_.lower_bound(begin);
+       iterator != memtable_.end() &&
+       (end.empty() || iterator->first < end);
+       ++iterator) {
+    const auto current = latest.find(iterator->first);
+    if (current == latest.end() ||
+        current->second.sequence < iterator->second.sequence) {
+      latest[iterator->first] = iterator->second;
+    }
+  }
+  std::vector<std::pair<std::string, std::string>> output;
+  output.reserve(latest.size());
+  for (const auto& [key, entry] : latest) {
+    if (!entry.tombstone) {
+      output.push_back({key, entry.value});
+    }
+  }
+  return output;
+}
+
 std::shared_ptr<LSMTree::Table> LSMTree::write_table(
     const std::map<std::string, Entry>& entries) {
   Bloom bloom(entries.size(), options_.bloom_bits_per_key);

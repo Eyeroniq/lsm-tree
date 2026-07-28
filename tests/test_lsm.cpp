@@ -168,6 +168,40 @@ void test_bloom_filter_has_no_false_negatives() {
   reset(directory);
 }
 
+void test_range_scan_reconciles_versions_and_tombstones() {
+  const auto directory = test_directory("scan");
+  reset(directory);
+  lsm::Options options;
+  options.memtable_bytes = 4096;
+  options.compaction_trigger = 10;
+  {
+    lsm::LSMTree database(directory, options);
+    database.put("a", "old-a");
+    database.put("b", "old-b");
+    database.put("c", "old-c");
+    database.put("d", "old-d");
+    database.flush();
+    database.put("b", "new-b");
+    database.erase("c");
+    database.put("e", "new-e");
+    const auto result = database.scan("b", "e");
+    const std::vector<std::pair<std::string, std::string>> expected = {
+        {"b", "new-b"}, {"d", "old-d"}};
+    CHECK(result == expected);
+    database.flush();
+  }
+  {
+    lsm::LSMTree database(directory, options);
+    const auto result = database.scan("", "");
+    const std::vector<std::pair<std::string, std::string>> expected = {
+        {"a", "old-a"}, {"b", "new-b"}, {"d", "old-d"}, {"e", "new-e"}};
+    CHECK(result == expected);
+    database.compact();
+    CHECK(database.scan("", "") == expected);
+  }
+  reset(directory);
+}
+
 void test_randomized_differential_replay() {
   const auto directory = test_directory("differential");
   reset(directory);
@@ -248,6 +282,7 @@ int main() {
   test_newest_value_and_tombstone_win();
   test_torn_wal_tail_is_repaired();
   test_bloom_filter_has_no_false_negatives();
+  test_range_scan_reconciles_versions_and_tombstones();
   test_randomized_differential_replay();
   test_corrupt_sstable_is_rejected();
   if (failures != 0) {
