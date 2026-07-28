@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: make test
+      - name: Run short crash campaign
+        run: make crash-test CRASH_ROUNDS=30
+      - name: Run benchmark smoke test
+        run: make benchmark
