@@ -3,7 +3,7 @@
 A dependency-free C++17 log-structured merge-tree storage engine built from
 first principles.
 
-[![CI](https://github.com/asp53826/lsm-tree/actions/workflows/ci.yml/badge.svg)](https://github.com/asp53826/lsm-tree/actions/workflows/ci.yml)
+[![CI](https://github.com/Eyeroniq/lsm-tree/actions/workflows/ci.yml/badge.svg)](https://github.com/Eyeroniq/lsm-tree/actions/workflows/ci.yml)
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?style=flat-square)
 ![dependencies](https://img.shields.io/badge/runtime_dependencies-0-2ea44f?style=flat-square)
 
