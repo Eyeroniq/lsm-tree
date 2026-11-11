@@ -57,11 +57,17 @@ class LSMTree {
       const std::map<std::string, Entry>& entries);
   void reset_wal();
   void sync_directory() const;
+  void require_writable() const;
 
   std::filesystem::path directory_;
   std::filesystem::path wal_path_;
   Options options_;
   int wal_fd_ = -1;
+  // Byte length of the WAL up to the end of its last complete record.
+  std::uint64_t wal_size_ = 0;
+  // Set when an I/O error leaves the on-disk state uncertain; all further
+  // mutations are refused until the database is reopened.
+  bool failed_ = false;
   std::uint64_t sequence_ = 0;
   std::uint64_t next_generation_ = 1;
   std::size_t memtable_size_ = 0;

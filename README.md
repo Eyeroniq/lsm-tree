@@ -44,7 +44,7 @@ Apple M2 Pro, macOS, Apple Clang 17:
 
 | Check | Result |
 |---|---:|
-| Correctness assertions | **4,064 passed** |
+| Correctness assertions | **4,073 passed** |
 | Seeded differential operations | 2,000 across five restarts |
 | Randomized hard-crash rounds | 100 |
 | Independently acknowledged writes lost | **0** |
@@ -185,7 +185,7 @@ does not pretend to have that proof.
 
 ## Verification strategy
 
-The 4,064 assertions include:
+The 4,073 assertions include:
 
 - values, overwrites and deletes across process reopen;
 - newest-version-wins reads across multiple SSTables;
@@ -193,6 +193,8 @@ The 4,064 assertions include:
 - Bloom-filter no-false-negative checks;
 - checksum rejection after single-byte SSTable corruption;
 - damaged WAL tail repair;
+- a WAL append cut short by a file-size limit is rolled back, so writes
+  acknowledged afterwards still survive reopen;
 - 2,000 seeded random mutations checked against `std::map` through five
   reopen cycles;
 - automatic flush and compaction under a 90-byte memtable limit.

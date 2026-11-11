@@ -433,6 +433,7 @@ void LSMTree::recover_wal() {
       system_error("repair WAL");
     }
   }
+  wal_size_ = offset;
 }
 
 void LSMTree::put(const std::string& key, const std::string& value) {
@@ -446,7 +447,8 @@ void LSMTree::mutate(const std::string& key, const std::string& value,
   if (key.empty() || key.size() > kMaxKey || value.size() > kMaxValue) {
     throw std::invalid_argument("invalid key or value length");
   }
-  const std::uint64_t sequence = ++sequence_;
+  require_writable();
+  const std::uint64_t sequence = sequence_ + 1;
   std::vector<std::uint8_t> record;
   record.reserve(kWalHeader + key.size() + value.size() + kChecksum);
   append_u32(record, kWalMagic);
@@ -458,10 +460,25 @@ void LSMTree::mutate(const std::string& key, const std::string& value,
   record.insert(record.end(), key.begin(), key.end());
   record.insert(record.end(), value.begin(), value.end());
   append_u32(record, crc32(record.data(), record.size()));
-  write_all(wal_fd_, record.data(), record.size());
+  try {
+    write_all(wal_fd_, record.data(), record.size());
+  } catch (...) {
+    // A partial record must not stay in the log: later appends would land
+    // after it, and recovery stops at the first damaged record, discarding
+    // everything behind it, including acknowledged writes.
+    if (::ftruncate(wal_fd_, static_cast<off_t>(wal_size_)) != 0) {
+      failed_ = true;
+    }
+    throw;
+  }
   if (options_.sync_writes && ::fsync(wal_fd_) != 0) {
+    // After a failed fsync the kernel may have dropped the dirty pages and
+    // cleared the error, so a later fsync could succeed without the data.
+    failed_ = true;
     system_error("fsync WAL");
   }
+  wal_size_ += record.size();
+  sequence_ = sequence;
 
   const auto current = memtable_.find(key);
   if (current != memtable_.end()) {
@@ -593,6 +610,7 @@ void LSMTree::flush() {
   if (memtable_.empty()) {
     return;
   }
+  require_writable();
   auto table = write_table(memtable_);
   tables_.insert(tables_.begin(), std::move(table));
   reset_wal();
@@ -607,6 +625,7 @@ void LSMTree::compact() {
   if (tables_.size() < 2) {
     return;
   }
+  require_writable();
   std::map<std::string, Entry> merged;
   for (const auto& table : tables_) {
     for (const auto& [key, entry] : table->entries) {
@@ -632,7 +651,17 @@ void LSMTree::compact() {
 
 void LSMTree::reset_wal() {
   if (::ftruncate(wal_fd_, 0) != 0 || ::fsync(wal_fd_) != 0) {
+    failed_ = true;
     system_error("reset WAL");
+  }
+  wal_size_ = 0;
+}
+
+void LSMTree::require_writable() const {
+  if (failed_) {
+    throw std::runtime_error(
+        "database refused the write after an earlier I/O error; reopen it "
+        "to recover");
   }
 }
 

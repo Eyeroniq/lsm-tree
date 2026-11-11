@@ -1,5 +1,6 @@
 #include "lsm/lsm.h"
 
+#include <csignal>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -7,6 +8,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <sys/resource.h>
 #include <unistd.h>
 
 namespace {
@@ -273,6 +275,46 @@ void test_corrupt_sstable_is_rejected() {
   reset(directory);
 }
 
+void test_failed_wal_write_does_not_lose_later_writes() {
+  const auto directory = test_directory("failed-write");
+  reset(directory);
+  const auto wal = directory / "active.wal";
+  {
+    lsm::LSMTree database(directory);
+    database.put("before", "kept");
+    const auto clean_size = std::filesystem::file_size(wal);
+
+    // Cap the file size so the next WAL append is cut off part-way.
+    struct rlimit original {};
+    CHECK(::getrlimit(RLIMIT_FSIZE, &original) == 0);
+    struct rlimit limited = original;
+    limited.rlim_cur = static_cast<rlim_t>(clean_size + 10);
+    const auto previous_handler = std::signal(SIGXFSZ, SIG_IGN);
+    CHECK(::setrlimit(RLIMIT_FSIZE, &limited) == 0);
+    bool failed = false;
+    try {
+      database.put("torn", std::string(64, 'x'));
+    } catch (const std::runtime_error&) {
+      failed = true;
+    }
+    CHECK(::setrlimit(RLIMIT_FSIZE, &original) == 0);
+    std::signal(SIGXFSZ, previous_handler);
+
+    CHECK(failed);
+    CHECK(std::filesystem::file_size(wal) == clean_size);
+    CHECK(!database.get("torn"));
+    database.put("after", "acknowledged");
+  }
+  {
+    lsm::LSMTree database(directory);
+    CHECK(database.get("before") == std::optional<std::string>("kept"));
+    CHECK(database.get("after") ==
+          std::optional<std::string>("acknowledged"));
+    CHECK(!database.get("torn"));
+  }
+  reset(directory);
+}
+
 }  // namespace
 
 int main() {
@@ -285,6 +327,7 @@ int main() {
   test_range_scan_reconciles_versions_and_tombstones();
   test_randomized_differential_replay();
   test_corrupt_sstable_is_rejected();
+  test_failed_wal_write_does_not_lose_later_writes();
   if (failures != 0) {
     std::cerr << failures << " of " << assertions << " assertions failed\n";
     return 1;
