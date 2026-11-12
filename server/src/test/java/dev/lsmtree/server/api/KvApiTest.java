@@ -96,6 +96,34 @@ class KvApiTest {
   }
 
   @Test
+  void demoLoadWritesKeysAndStatsReportLevels() throws Exception {
+    mvc.perform(post("/api/v1/demo/load").param("count", "300"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.written").value(300));
+    mvc.perform(get("/api/v1/kv").param("from", "demo:").param("to", "demo;"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.items.length()").value(greaterThanOrEqualTo(1)));
+    mvc.perform(get("/api/v1/admin/stats"))
+        .andExpect(jsonPath("$.tablesPerLevel.length()").value(7))
+        .andExpect(jsonPath("$.sequence").value(greaterThanOrEqualTo(300)));
+    mvc.perform(post("/api/v1/demo/read").param("count", "200"))
+        .andExpect(status().isOk())
+        .andExpect(jsonPath("$.read").value(200))
+        .andExpect(jsonPath("$.found").value(greaterThanOrEqualTo(1)));
+    mvc.perform(post("/api/v1/demo/load").param("count", "0"))
+        .andExpect(status().isBadRequest());
+  }
+
+  @Test
+  void dashboardIsServedAtTheRoot() throws Exception {
+    mvc.perform(get("/index.html"))
+        .andExpect(status().isOk())
+        .andExpect(content().string(containsString("The tree, live")));
+    mvc.perform(get("/assets/app.js")).andExpect(status().isOk());
+    mvc.perform(get("/assets/app.css")).andExpect(status().isOk());
+  }
+
+  @Test
   void metricsAndApiDocsArePublished() throws Exception {
     mvc.perform(get("/actuator/metrics/lsm.sstables")).andExpect(status().isOk());
     mvc.perform(get("/actuator/health"))

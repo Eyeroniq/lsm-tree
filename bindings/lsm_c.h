@@ -26,18 +26,27 @@ enum {
   LSM_ERROR = 3
 };
 
+#define LSM_MAX_LEVELS 7
+
 typedef struct {
   uint64_t memtable_entries;
   uint64_t sstable_count;
   uint64_t sequence;
   uint64_t bloom_checks;
   uint64_t bloom_negative_hits;
+  uint64_t block_reads;
+  uint64_t block_cache_hits;
+  uint64_t compaction_bytes_written;
+  uint64_t tables_per_level[LSM_MAX_LEVELS];
 } lsm_stats;
 
 /* Opens (or creates) the database in `path`, a NUL-terminated string. */
+/* table_bytes and level1_bytes size leveled compaction; 0 keeps the
+ * engine's default. */
 int lsm_open(const char* path, uint64_t memtable_bytes,
              uint64_t bloom_bits_per_key, uint64_t compaction_trigger,
-             int sync_writes, lsm_db** out, char** error);
+             uint64_t table_bytes, uint64_t level1_bytes, int sync_writes,
+             lsm_db** out, char** error);
 void lsm_close(lsm_db* db);
 
 int lsm_put(lsm_db* db, const char* key, uint64_t key_len, const char* value,

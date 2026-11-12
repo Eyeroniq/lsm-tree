@@ -51,7 +51,7 @@ public final class LsmStore implements AutoCloseable {
     MethodHandle open = linker.downcallHandle(
         find(library, "lsm_open"),
         FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, JAVA_LONG, JAVA_LONG,
-            JAVA_INT, ADDRESS, ADDRESS));
+            JAVA_LONG, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS));
     closeHandle = linker.downcallHandle(
         find(library, "lsm_close"), FunctionDescriptor.ofVoid(ADDRESS));
     putHandle = linker.downcallHandle(
@@ -86,7 +86,8 @@ public final class LsmStore implements AutoCloseable {
       int status = (int) open.invokeExact(
           arena.allocateFrom(directory.toAbsolutePath().toString()),
           options.memtableBytes(), options.bloomBitsPerKey(),
-          options.compactionTrigger(), options.syncWrites() ? 1 : 0, out, error);
+          options.compactionTrigger(), options.tableBytes(), options.level1Bytes(),
+          options.syncWrites() ? 1 : 0, out, error);
       check(status, error);
       database = out.get(ADDRESS, 0);
     } catch (RuntimeException exception) {
@@ -180,11 +181,17 @@ public final class LsmStore implements AutoCloseable {
 
   public LsmStats stats() {
     return call(arena -> {
-      MemorySegment out = arena.allocate(JAVA_LONG, 5);
+      // lsm_stats: eight counters, then LSM_MAX_LEVELS table counts.
+      MemorySegment out = arena.allocate(JAVA_LONG, 8 + LsmStats.MAX_LEVELS);
       statsHandle.invokeExact(database, out);
+      long[] levels = new long[LsmStats.MAX_LEVELS];
+      for (int level = 0; level < levels.length; level++) {
+        levels[level] = out.getAtIndex(JAVA_LONG, 8 + level);
+      }
       return new LsmStats(out.getAtIndex(JAVA_LONG, 0), out.getAtIndex(JAVA_LONG, 1),
           out.getAtIndex(JAVA_LONG, 2), out.getAtIndex(JAVA_LONG, 3),
-          out.getAtIndex(JAVA_LONG, 4));
+          out.getAtIndex(JAVA_LONG, 4), out.getAtIndex(JAVA_LONG, 5),
+          out.getAtIndex(JAVA_LONG, 6), out.getAtIndex(JAVA_LONG, 7), levels);
     });
   }
 
