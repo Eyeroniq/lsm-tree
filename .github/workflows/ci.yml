@@ -18,3 +18,27 @@ jobs:
         run: make crash-test CRASH_ROUNDS=30
       - name: Run benchmark smoke test
         run: make benchmark
+
+  java:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+      - name: Build engine library
+        run: make shared
+      - name: Test Spring Boot service
+        run: cd server && mvn -B verify
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build service image
+        run: docker build -t lsm-tree-server .
