@@ -22,7 +22,11 @@ first principles.
 - compaction durably installs a replacement before deleting old generations;
 - incomplete WAL tails are detected and repaired to the verified record
   boundary;
-- SSTable corruption is rejected instead of silently returning suspect data.
+- SSTable corruption is rejected instead of silently returning suspect data;
+- an exclusive `LOCK` file stops a second process from opening the same
+  database directory;
+- an optional Spring Boot service exposes the engine over HTTP (see
+  [HTTP service](#http-service-spring-boot)).
 
 ```mermaid
 flowchart LR
@@ -44,7 +48,7 @@ Apple M2 Pro, macOS, Apple Clang 17:
 
 | Check | Result |
 |---|---:|
-| Correctness assertions | **4,073 passed** |
+| Correctness assertions | **4,079 passed** |
 | Seeded differential operations | 2,000 across five restarts |
 | Randomized hard-crash rounds | 100 |
 | Independently acknowledged writes lost | **0** |
@@ -100,7 +104,8 @@ compaction, and does not implement snapshots or concurrent readers. The tests
 focus on the invariants those future features must preserve.
 
 No database, serialization library, checksum package, Bloom-filter package, or
-test framework is hidden behind the implementation.
+test framework is hidden behind the implementation. The optional HTTP service
+in `server/` uses Spring Boot, but the engine itself stays dependency-free.
 
 ## Why the write order is the design
 
@@ -185,7 +190,7 @@ does not pretend to have that proof.
 
 ## Verification strategy
 
-The 4,073 assertions include:
+The 4,079 assertions include:
 
 - values, overwrites and deletes across process reopen;
 - newest-version-wins reads across multiple SSTables;
@@ -195,6 +200,8 @@ The 4,073 assertions include:
 - damaged WAL tail repair;
 - a WAL append cut short by a file-size limit is rolled back, so writes
   acknowledged afterwards still survive reopen;
+- a second open of a locked database directory is refused;
+- half-written `sst-N.dat.tmp` files left by a crash are removed on open;
 - 2,000 seeded random mutations checked against `std::map` through five
   reopen cycles;
 - automatic flush and compaction under a 90-byte memtable limit.
@@ -226,6 +233,57 @@ db.flush();
 db.compact();
 ```
 
+## HTTP service (Spring Boot)
+
+`server/` is a Spring Boot 4 application on Java 25 that serves the engine over
+HTTP. It calls the C++ library in-process through Java's Foreign Function &
+Memory API, so there is no JNI glue and no second process. The C ABI it binds
+to is `bindings/lsm_c.h`; C++ exceptions are converted to status codes there
+and never cross into Java.
+
+```bash
+make shared        # build/liblsm.so (or .dylib on macOS)
+make java-test     # JUnit: FFM binding + HTTP API against the real engine
+make server        # http://localhost:8080
+```
+
+| Method | Path | Purpose |
+|---|---|---|
+| `PUT` | `/api/v1/kv/{key}` | write the request body; 204 once fsynced |
+| `GET` | `/api/v1/kv/{key}` | read a value; 404 if absent or deleted |
+| `DELETE` | `/api/v1/kv/{key}` | delete a key |
+| `GET` | `/api/v1/kv?from=&to=&limit=` | scan `[from, to)` as JSON |
+| `POST` | `/api/v1/admin/flush`, `/api/v1/admin/compact` | maintenance |
+| `GET` | `/api/v1/admin/stats` | engine counters |
+
+Interactive docs are at `/swagger-ui.html`, health at `/actuator/health`, and
+the engine counters are published as Micrometer metrics (`lsm.sstables`,
+`lsm.memtable.entries`, `lsm.sequence`, `lsm.bloom.checks`,
+`lsm.bloom.negatives`) under `/actuator/metrics`.
+
+The engine is single-threaded, so the service takes one lock around every
+call. The engine's `LOCK` file means only one service instance can own a data
+directory. Keys and values are treated as UTF-8 text at the HTTP layer.
+
+Settings bind from `application.properties` or environment variables:
+`LSM_DATA_DIR`, `LSM_LIBRARY_PATH`, `LSM_MEMTABLE_BYTES`,
+`LSM_COMPACTION_TRIGGER`, `LSM_SYNC_WRITES`.
+
+```bash
+docker build -t lsm-tree-server .
+docker run -p 8080:8080 -v lsm-data:/data lsm-tree-server
+
+curl -X PUT --data-binary 'Ada' localhost:8080/api/v1/kv/user:1
+curl localhost:8080/api/v1/kv/user:1
+curl 'localhost:8080/api/v1/kv?from=user:&to=user;'
+```
+
+`make smoke-test` builds the image and drives a real container over HTTP:
+reads, writes, deletes and scans; a graceful restart; a `SIGKILL` after an
+acknowledged write, which must still be readable afterwards; and a second
+container on the same volume, which the `LOCK` file must refuse. CI runs it on
+every push.
+
 ## Repository map
 
 ```text
@@ -234,7 +292,10 @@ src/lsm.cpp             WAL, recovery, Bloom filter, SSTables and scans
 src/main.cpp            crash workload, oracle verifier and benchmark
 tests/test_lsm.cpp       deterministic and randomized correctness suite
 scripts/crash_torture.py external process-kill campaign
-.github/workflows/ci.yml macOS/Linux tests, crashes and smoke benchmark
+bindings/lsm_c.h         C ABI over the engine for foreign callers
+server/                  Spring Boot HTTP service (Java 25, FFM)
+Dockerfile               engine library + service in one image
+.github/workflows/ci.yml engine, Java and Docker jobs on macOS/Linux
 ```
 
 ## What would come next

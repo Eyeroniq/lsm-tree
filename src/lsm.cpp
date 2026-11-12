@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <stdexcept>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -324,16 +325,21 @@ LSMTree::LSMTree(std::filesystem::path directory, Options options)
     throw std::invalid_argument("invalid LSM options");
   }
   std::filesystem::create_directories(directory_);
-  discover_tables();
-  wal_fd_ = ::open(wal_path_.c_str(), O_CREAT | O_RDWR | O_APPEND, 0644);
-  if (wal_fd_ < 0) {
-    system_error("open WAL");
-  }
+  acquire_lock();
   try {
+    discover_tables();
+    wal_fd_ = ::open(wal_path_.c_str(), O_CREAT | O_RDWR | O_APPEND, 0644);
+    if (wal_fd_ < 0) {
+      system_error("open WAL");
+    }
     recover_wal();
   } catch (...) {
-    ::close(wal_fd_);
-    wal_fd_ = -1;
+    if (wal_fd_ >= 0) {
+      ::close(wal_fd_);
+      wal_fd_ = -1;
+    }
+    ::close(lock_fd_);
+    lock_fd_ = -1;
     throw;
   }
 }
@@ -342,12 +348,44 @@ LSMTree::~LSMTree() {
   if (wal_fd_ >= 0) {
     ::close(wal_fd_);
   }
+  if (lock_fd_ >= 0) {
+    ::close(lock_fd_);  // Releases the flock.
+  }
+}
+
+void LSMTree::acquire_lock() {
+  const auto lock_path = directory_ / "LOCK";
+  lock_fd_ = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0644);
+  if (lock_fd_ < 0) {
+    system_error("open LOCK");
+  }
+  // flock locks belong to the open file description, so a second open of
+  // the same directory fails in this process as well as in others.
+  if (::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
+    const int saved = errno;
+    ::close(lock_fd_);
+    lock_fd_ = -1;
+    if (saved == EWOULDBLOCK) {
+      throw std::runtime_error("database directory is already open: " +
+                               directory_.string());
+    }
+    errno = saved;
+    system_error("lock database directory");
+  }
 }
 
 void LSMTree::discover_tables() {
   tables_.clear();
+  std::vector<std::filesystem::path> abandoned;
   for (const auto& item : std::filesystem::directory_iterator(directory_)) {
     if (!item.is_regular_file()) {
+      continue;
+    }
+    const std::string name = item.path().filename().string();
+    if (name.rfind("sst-", 0) == 0 && item.path().extension() == ".tmp") {
+      // A table that was never renamed into place was never part of the
+      // database; its data is still in the WAL or in the source tables.
+      abandoned.push_back(item.path());
       continue;
     }
     const std::uint64_t generation = generation_from_path(item.path());
@@ -357,6 +395,10 @@ void LSMTree::discover_tables() {
     auto table = load_table(item.path());
     tables_.push_back(std::move(table));
     next_generation_ = std::max(next_generation_, generation + 1);
+  }
+  for (const auto& path : abandoned) {
+    std::error_code error;
+    std::filesystem::remove(path, error);
   }
   std::sort(tables_.begin(), tables_.end(),
             [](const auto& left, const auto& right) {
@@ -525,14 +567,20 @@ std::vector<std::pair<std::string, std::string>> LSMTree::scan(
   }
   std::map<std::string, Entry> latest;
   for (const auto& table : tables_) {
-    for (const auto& [key, entry] : table->entries) {
-      if (key < begin || (!end.empty() && key >= end)) {
-        continue;
-      }
-      const auto current = latest.find(key);
+    // Entries are sorted, so jump to the first key in range instead of
+    // walking the whole table.
+    auto item = std::lower_bound(
+        table->entries.begin(), table->entries.end(), begin,
+        [](const auto& candidate, const std::string& target) {
+          return candidate.first < target;
+        });
+    for (; item != table->entries.end() &&
+           (end.empty() || item->first < end);
+         ++item) {
+      const auto current = latest.find(item->first);
       if (current == latest.end() ||
-          current->second.sequence < entry.sequence) {
-        latest[key] = entry;
+          current->second.sequence < item->second.sequence) {
+        latest[item->first] = item->second;
       }
     }
   }

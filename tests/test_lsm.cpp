@@ -315,6 +315,50 @@ void test_failed_wal_write_does_not_lose_later_writes() {
   reset(directory);
 }
 
+void test_directory_lock_rejects_second_open() {
+  const auto directory = test_directory("lock");
+  reset(directory);
+  {
+    lsm::LSMTree database(directory);
+    database.put("owner", "first");
+    bool rejected = false;
+    try {
+      lsm::LSMTree second(directory);
+    } catch (const std::runtime_error&) {
+      rejected = true;
+    }
+    CHECK(rejected);
+    CHECK(database.get("owner") == std::optional<std::string>("first"));
+  }
+  {
+    lsm::LSMTree database(directory);
+    CHECK(database.get("owner") == std::optional<std::string>("first"));
+  }
+  reset(directory);
+}
+
+void test_abandoned_temporary_table_is_removed() {
+  const auto directory = test_directory("tmp-table");
+  reset(directory);
+  {
+    lsm::LSMTree database(directory);
+    database.put("durable", "value");
+    database.flush();
+  }
+  const auto abandoned = directory / "sst-99.dat.tmp";
+  {
+    std::ofstream output(abandoned, std::ios::binary);
+    output << "half-written table";
+  }
+  {
+    lsm::LSMTree database(directory);
+    CHECK(!std::filesystem::exists(abandoned));
+    CHECK(database.get("durable") == std::optional<std::string>("value"));
+    CHECK(database.stats().sstable_count == 1);
+  }
+  reset(directory);
+}
+
 }  // namespace
 
 int main() {
@@ -328,6 +372,8 @@ int main() {
   test_randomized_differential_replay();
   test_corrupt_sstable_is_rejected();
   test_failed_wal_write_does_not_lose_later_writes();
+  test_directory_lock_rejects_second_open();
+  test_abandoned_temporary_table_is_removed();
   if (failures != 0) {
     std::cerr << failures << " of " << assertions << " assertions failed\n";
     return 1;

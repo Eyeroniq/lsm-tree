@@ -14,15 +14,37 @@ LIB_OBJECT := $(BUILD_DIR)/lsm.o
 TOOL := $(BUILD_DIR)/lsm_tool
 TEST := $(BUILD_DIR)/test_lsm
 
-.PHONY: all test crash-test benchmark clean
+ifeq ($(shell uname -s),Darwin)
+SHARED_EXT := dylib
+else
+SHARED_EXT := so
+endif
+PIC_DIR := $(BUILD_DIR)/pic
+SHARED_LIB := $(BUILD_DIR)/liblsm.$(SHARED_EXT)
+
+.PHONY: all shared test crash-test benchmark java-test server smoke-test clean
 
 all: $(TOOL)
+
+shared: $(SHARED_LIB)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
+$(PIC_DIR):
+	mkdir -p $(PIC_DIR)
+
 $(LIB_OBJECT): src/lsm.cpp include/lsm/lsm.h | $(BUILD_DIR)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
+$(PIC_DIR)/lsm.o: src/lsm.cpp include/lsm/lsm.h | $(PIC_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fPIC -c $< -o $@
+
+$(PIC_DIR)/lsm_c.o: bindings/lsm_c.cpp bindings/lsm_c.h include/lsm/lsm.h | $(PIC_DIR)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -fPIC -c $< -o $@
+
+$(SHARED_LIB): $(PIC_DIR)/lsm.o $(PIC_DIR)/lsm_c.o
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -shared $^ -o $@
 
 $(TOOL): src/main.cpp $(LIB_OBJECT)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) $^ -o $@
@@ -40,5 +62,15 @@ crash-test: $(TOOL)
 benchmark: $(TOOL)
 	./$(TOOL) benchmark $(BUILD_DIR)/benchmark.db 20000
 
+java-test: $(SHARED_LIB)
+	cd server && mvn -B -q verify
+
+server: $(SHARED_LIB)
+	cd server && mvn -B -q spring-boot:run
+
+smoke-test:
+	docker build -t lsm-tree-server .
+	bash scripts/smoke_test.sh lsm-tree-server
+
 clean:
-	rm -rf $(BUILD_DIR)
+	rm -rf $(BUILD_DIR) server/target
