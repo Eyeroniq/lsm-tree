@@ -1,0 +1,14 @@
+{
+  "intro": "This is lsm-tree, a crash-safe storage engine I built from scratch in C++. Everything in this video runs for real, on the real code, with no mocks.",
+  "tests": "First, the test suite. More than eight thousand assertions cover recovery, leveled compaction, snapshots, and writers racing readers.",
+  "asan": "Next, the same suite under AddressSanitizer and undefined-behavior checks. Every allocation, read and write is checked, and it comes out clean.",
+  "sanitizers": "Then ThreadSanitizer, for concurrency. Readers, writers and the background compaction thread share data safely, without a single race.",
+  "crash": "The crash campaign kills the writer with SIGKILL at random moments, even in the middle of compaction. It then checks every acknowledged write, and none are lost.",
+  "powercut": "But a killed process is not a power cut. This shim keeps only what was really fsynced, rebuilds the directory from that, and still nothing is lost.",
+  "mutation": "Does that test have teeth? Put back the real bug it found, one missing directory fsync, and the very first power cut catches the lost write.",
+  "benchmark": "Then performance. Twenty thousand fsynced writes, then twenty thousand random reads at well over a million per second, thanks to Bloom filters and a block cache.",
+  "ondisk": "This is what the engine leaves on disk. There is a write-ahead log per memtable, an append-only MANIFEST, and sorted, checksummed tables.",
+  "service": "The engine also runs as a Spring Boot service, calling C++ through Java's foreign function API. Its integration tests pass against the real library.",
+  "recovery": "Finally, recovery over HTTP. We write three keys and kill the server with SIGKILL. After a restart, every acknowledged key is still there.",
+  "outro": "Leveled compaction, snapshots, a write-ahead log and a MANIFEST, proven under crashes and power cuts. The code and every test are on GitHub."
+}

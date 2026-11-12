@@ -1,0 +1,14 @@
+{
+  "intro": "This is lsm-tree, a crash-safe database engine I built from scratch in C++. It runs behind a Spring Boot API, with this live dashboard showing what happens inside.",
+  "overview": "The dashboard polls the real engine twice a second. It shows writes, tables, Bloom filter skips, cache hits and every level of the tree, in dark or light mode.",
+  "write": "Let's write five thousand keys. Each write is fsynced before it is acknowledged. Watch the memtable flush into level zero, while background compaction pushes tables down the levels.",
+  "read": "Now read five thousand random keys, many of which don't exist. Bloom filters rule out most tables for missing keys, and the block cache serves almost every block from memory.",
+  "explorer": "The key explorer talks to the same REST API as everything else. Put a value, and read it straight back from the engine, through Java and into C++.",
+  "delete": "Deleting a key writes a tombstone. Reads stop at that tombstone, so the old value never comes back, even while older tables still hold it.",
+  "scan": "Range scans return keys in sorted order. They merge the memtable and every level on disk into one consistent view, and skip anything deleted.",
+  "compact": "A full compaction merges every table into the deepest level. Overwritten values and tombstones are dropped for good, and the tree is tidy again.",
+  "crash": "Now the real test. We kill the server with SIGKILL and restart it. The dashboard reconnects on its own, and the key we wrote is still there.",
+  "api": "Every button is a documented REST endpoint. The interactive OpenAPI docs are built into the service, ready for any client to try.",
+  "metrics": "The engine's counters are also exported as Micrometer metrics through Spring Boot Actuator, next to a health check for monitoring.",
+  "outro": "C++17 and Java 25, Spring Boot and Docker, tested against crashes and power cuts. The code, the tests and this dashboard are all on GitHub."
+}

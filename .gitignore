@@ -6,3 +6,4 @@ __pycache__/
 server/target/
 server/data/
 server/demo-data/
+demo/*.mp4
