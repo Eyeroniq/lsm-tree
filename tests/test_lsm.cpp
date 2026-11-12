@@ -44,6 +44,11 @@ lsm::Options small_options() {
   // Tiny blocks so most tables span several blocks and cursors cross
   // block boundaries during reads, scans and compaction.
   options.block_bytes = 64;
+  // Tiny tables and levels so data moves through many levels, exercising
+  // multi-table compactions, trivial moves and tombstone collection.
+  options.table_bytes = 256;
+  options.level1_bytes = 512;
+  options.level_multiplier = 2;
   return options;
 }
 
@@ -123,7 +128,14 @@ void test_newest_value_and_tombstone_win() {
     CHECK(!database.get("shared"));
     database.compact();
     CHECK(!database.get("shared"));
-    CHECK(database.stats().sstable_count == 1);
+    // A full compaction leaves nothing below that the tombstone must hide,
+    // so the tombstone and every older version are dropped entirely.
+    CHECK(database.stats().sstable_count == 0);
+  }
+  {
+    lsm::LSMTree database(directory, options);
+    CHECK(!database.get("shared"));
+    CHECK(database.scan("", "").empty());
   }
   reset(directory);
 }
@@ -594,6 +606,159 @@ void test_value_larger_than_a_block() {
   reset(directory);
 }
 
+std::size_t deepest_level(const lsm::Stats& stats) {
+  std::size_t deepest = 0;
+  for (std::size_t level = 0; level < stats.tables_per_level.size(); ++level) {
+    if (stats.tables_per_level[level] != 0) {
+      deepest = level;
+    }
+  }
+  return deepest;
+}
+
+void test_data_moves_through_levels() {
+  const auto directory = test_directory("levels");
+  reset(directory);
+  auto options = small_options();
+  options.sync_writes = false;
+  std::map<std::string, std::optional<std::string>> oracle;
+  std::mt19937 random(424242);
+  std::vector<std::size_t> levels_before;
+  {
+    lsm::LSMTree database(directory, options);
+    for (int step = 0; step < 3000; ++step) {
+      const std::string key = numbered("level-", static_cast<int>(random() % 600));
+      if (random() % 6 == 0) {
+        database.erase(key);
+        oracle[key] = std::nullopt;
+      } else {
+        const std::string value = "v" + std::to_string(random() % 100000);
+        database.put(key, value);
+        oracle[key] = value;
+      }
+    }
+    const auto stats = database.stats();
+    CHECK(deepest_level(stats) >= 3);
+    CHECK(stats.tables_per_level[0] < options.compaction_trigger);
+    CHECK(stats.compaction_bytes_written > 0);
+    for (const auto& [key, value] : oracle) {
+      CHECK(database.get(key) == value);
+    }
+    levels_before = stats.tables_per_level;
+  }
+  // Reopening rebuilds the same levels from the MANIFEST (and checks that
+  // no two tables in a level >= 1 overlap).
+  lsm::LSMTree database(directory, options);
+  CHECK(database.stats().tables_per_level == levels_before);
+  std::vector<std::pair<std::string, std::string>> expected;
+  for (const auto& [key, value] : oracle) {
+    CHECK(database.get(key) == value);
+    if (value) {
+      expected.emplace_back(key, *value);
+    }
+  }
+  CHECK(database.scan("", "") == expected);
+  reset(directory);
+}
+
+void test_manifest_decides_which_tables_are_live() {
+  // A table that was renamed into place but never reached the MANIFEST (a
+  // compaction that crashed before committing) must be ignored and removed,
+  // even though its generation is the newest in the directory.
+  const auto stray_source = test_directory("stray-source");
+  const auto directory = test_directory("stray");
+  reset(stray_source);
+  reset(directory);
+  {
+    lsm::LSMTree database(stray_source);
+    database.put("key", "stale");
+    database.flush();
+  }
+  {
+    lsm::LSMTree database(directory);
+    database.put("key", "live");
+    database.flush();
+  }
+  const auto stray = directory / "sst-50.dat";
+  std::filesystem::copy_file(stray_source / "sst-1.dat", stray);
+  {
+    lsm::LSMTree database(directory);
+    CHECK(database.get("key") == std::optional<std::string>("live"));
+    CHECK(!std::filesystem::exists(stray));
+    CHECK(database.stats().sstable_count == 1);
+  }
+  reset(stray_source);
+  reset(directory);
+}
+
+void test_directory_without_manifest_is_migrated() {
+  const auto directory = test_directory("no-manifest");
+  reset(directory);
+  {
+    lsm::LSMTree database(directory);
+    database.put("a", "1");
+    database.flush();
+    database.put("a", "2");
+    database.put("b", "3");
+    database.flush();
+  }
+  // Directories written before the MANIFEST existed have none.
+  std::filesystem::remove(directory / "MANIFEST");
+  {
+    lsm::LSMTree database(directory);
+    CHECK(std::filesystem::exists(directory / "MANIFEST"));
+    CHECK(database.get("a") == std::optional<std::string>("2"));
+    CHECK(database.get("b") == std::optional<std::string>("3"));
+    CHECK(database.stats().tables_per_level[0] == 2);
+  }
+  reset(directory);
+}
+
+void test_damaged_manifest_is_rejected() {
+  const auto directory = test_directory("bad-manifest");
+  reset(directory);
+  {
+    lsm::LSMTree database(directory);
+    database.put("key", "value");
+    database.flush();
+  }
+  {
+    std::fstream file(directory / "MANIFEST",
+                      std::ios::binary | std::ios::in | std::ios::out);
+    file.seekg(12);
+    char byte = 0;
+    file.read(&byte, 1);
+    byte ^= 0x5A;
+    file.seekp(12);
+    file.write(&byte, 1);
+  }
+  bool rejected = false;
+  try {
+    lsm::LSMTree database(directory);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  CHECK(rejected);
+  reset(directory);
+
+  // A table the MANIFEST lists but that is missing is also fatal: guessing
+  // could resurrect older data.
+  {
+    lsm::LSMTree database(directory);
+    database.put("key", "value");
+    database.flush();
+  }
+  std::filesystem::remove(directory / "sst-1.dat");
+  bool missing_rejected = false;
+  try {
+    lsm::LSMTree database(directory);
+  } catch (const std::runtime_error&) {
+    missing_rejected = true;
+  }
+  CHECK(missing_rejected);
+  reset(directory);
+}
+
 }  // namespace
 
 int main() {
@@ -614,6 +779,10 @@ int main() {
   test_disabled_block_cache_reads_from_disk();
   test_corrupt_data_block_is_detected_on_read();
   test_value_larger_than_a_block();
+  test_data_moves_through_levels();
+  test_manifest_decides_which_tables_are_live();
+  test_directory_without_manifest_is_migrated();
+  test_damaged_manifest_is_rejected();
   if (failures != 0) {
     std::cerr << failures << " of " << assertions << " assertions failed\n";
     return 1;

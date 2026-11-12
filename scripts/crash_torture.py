@@ -48,7 +48,13 @@ def main() -> int:
                 stderr=subprocess.PIPE,
                 text=True,
             )
-            time.sleep(randomizer.uniform(0.001, 0.022))
+            # Short runs kill the writer around WAL appends. Long runs let
+            # flushes, compactions and MANIFEST updates get under way, since
+            # split writes make each of those take several milliseconds.
+            if randomizer.random() < 0.5:
+                time.sleep(randomizer.uniform(0.001, 0.022))
+            else:
+                time.sleep(randomizer.uniform(0.022, 0.25))
             if writer.poll() is not None:
                 raise RuntimeError(
                     f"writer exited before crash {crash_index}: "
@@ -65,6 +71,12 @@ def main() -> int:
             metrics = parse_metrics(verified.stdout)
             for name in high_water:
                 high_water[name] = max(high_water[name], metrics[name])
+
+    if args.rounds >= 20 and high_water["sstables"] == 0:
+        raise RuntimeError(
+            "crash campaign never observed an SSTable, so no kill landed in "
+            "a flush or compaction; the test would prove only WAL recovery"
+        )
 
     result = {
         "rounds": args.rounds,

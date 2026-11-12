@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <list>
+#include <set>
 #include <stdexcept>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -244,6 +245,11 @@ struct LSMTree::Table {
   std::uint32_t version = 0;
   std::uint64_t entry_count = 0;
   std::uint64_t max_sequence = 0;
+  std::uint64_t file_bytes = 0;
+  std::size_t level = 0;
+  // Key range; both empty only for a table with no entries.
+  std::string smallest;
+  std::string largest;
   Bloom bloom;
   // Version 1: every entry, loaded at open.
   std::vector<std::pair<std::string, Entry>> entries;
@@ -526,12 +532,22 @@ std::shared_ptr<Table> load_table(const std::filesystem::path& path) {
     throw std::runtime_error("unsupported SSTable header");
   }
   table->version = read_u32(header + 4);
+  table->file_bytes = size;
   if (table->version == kTableVersion1) {
     load_v1(*table, size);
     ::close(table->fd);  // Everything is in memory now.
     table->fd = -1;
+    if (!table->entries.empty()) {
+      table->smallest = table->entries.front().first;
+      table->largest = table->entries.back().first;
+    }
   } else if (table->version == kTableVersion2) {
     load_v2(*table, size);
+    if (!table->index.empty()) {
+      // The smallest key needs a block read; the caller supplies it, from
+      // the MANIFEST or from the first block.
+      table->largest = table->index.back().last_key;
+    }
   } else {
     throw std::runtime_error("unsupported SSTable version");
   }
@@ -705,6 +721,9 @@ class TableWriter {
     }
   }
 
+  // Bytes written so far; after finish(), the size of the file.
+  std::uint64_t bytes_written() const { return offset_; }
+
   // Writes the index, Bloom filter and footer, then fsyncs and closes.
   void finish() {
     flush_block();
@@ -781,6 +800,113 @@ void build_table(const std::filesystem::path& path, const Options& options,
   }
 }
 
+constexpr std::uint32_t kManifestMagic = 0x314E414DU;  // MAN1
+constexpr std::uint32_t kManifestVersion = 1;
+constexpr std::size_t kMaxLevels = 7;
+
+struct ManifestTable {
+  std::uint64_t generation = 0;
+  std::uint32_t level = 0;
+  std::string smallest;
+  std::string largest;
+};
+
+struct Manifest {
+  std::uint64_t next_generation = 1;
+  std::vector<ManifestTable> tables;
+};
+
+// MANIFEST: [magic | version | next_generation u64 | count u32 |
+//            (generation u64 | level u32 | smallest_len u32 | smallest |
+//             largest_len u32 | largest)... | CRC32]
+// Returns nullopt when the file does not exist, which means the directory
+// predates levels: every table in it is then treated as level 0.
+std::optional<Manifest> read_manifest(const std::filesystem::path& path) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    if (errno == ENOENT) {
+      return std::nullopt;
+    }
+    system_error("open MANIFEST");
+  }
+  std::vector<std::uint8_t> bytes;
+  try {
+    struct stat info {};
+    if (::fstat(fd, &info) != 0) {
+      system_error("fstat MANIFEST");
+    }
+    bytes.resize(static_cast<std::size_t>(info.st_size));
+    if (!read_exact(fd, 0, bytes.data(), bytes.size())) {
+      throw std::runtime_error("short MANIFEST read");
+    }
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
+  ::close(fd);
+
+  if (bytes.size() < 24) {
+    throw std::runtime_error("MANIFEST is too small");
+  }
+  const std::size_t limit = bytes.size() - kChecksum;
+  if (crc32(bytes.data(), limit) != read_u32(bytes.data() + limit)) {
+    throw std::runtime_error("MANIFEST checksum mismatch");
+  }
+  if (read_u32(bytes.data()) != kManifestMagic ||
+      read_u32(bytes.data() + 4) != kManifestVersion) {
+    throw std::runtime_error("unsupported MANIFEST header");
+  }
+  Manifest manifest;
+  manifest.next_generation = read_u64(bytes.data() + 8);
+  const std::uint32_t count = read_u32(bytes.data() + 16);
+  std::size_t position = 20;
+  const auto take_key = [&](std::string& out) {
+    if (limit - position < 4) {
+      throw std::runtime_error("truncated MANIFEST");
+    }
+    const std::uint32_t length = read_u32(bytes.data() + position);
+    position += 4;
+    if (length > kMaxKey || limit - position < length) {
+      throw std::runtime_error("invalid MANIFEST key length");
+    }
+    out.assign(reinterpret_cast<const char*>(bytes.data() + position), length);
+    position += length;
+  };
+  for (std::uint32_t index = 0; index < count; ++index) {
+    if (limit - position < 12) {
+      throw std::runtime_error("truncated MANIFEST");
+    }
+    ManifestTable table;
+    table.generation = read_u64(bytes.data() + position);
+    table.level = read_u32(bytes.data() + position + 8);
+    position += 12;
+    take_key(table.smallest);
+    take_key(table.largest);
+    if (table.generation == 0 || table.level >= kMaxLevels) {
+      throw std::runtime_error("invalid MANIFEST table entry");
+    }
+    manifest.tables.push_back(std::move(table));
+  }
+  if (position != limit) {
+    throw std::runtime_error("unexpected bytes after MANIFEST entries");
+  }
+  return manifest;
+}
+
+// Smallest key of a table, reading its first block if necessary.
+std::string first_key(const Table& table) {
+  std::uint64_t ignored = 0;
+  TableCursor cursor(table, nullptr, ignored);
+  cursor.seek("");
+  return cursor.valid() ? cursor.key() : std::string();
+}
+
+bool overlaps(const Table& table, const std::string& smallest,
+              const std::string& largest) {
+  return table.entry_count != 0 && !(table.largest < smallest) &&
+         !(largest < table.smallest);
+}
+
 }  // namespace
 
 LSMTree::LSMTree(std::filesystem::path directory, Options options)
@@ -788,14 +914,16 @@ LSMTree::LSMTree(std::filesystem::path directory, Options options)
       wal_path_(directory_ / "active.wal"),
       options_(options) {
   if (options_.memtable_bytes == 0 || options_.bloom_bits_per_key == 0 ||
-      options_.compaction_trigger < 2 || options_.block_bytes == 0) {
+      options_.compaction_trigger < 2 || options_.block_bytes == 0 ||
+      options_.table_bytes == 0 || options_.level1_bytes == 0 ||
+      options_.level_multiplier < 2) {
     throw std::invalid_argument("invalid LSM options");
   }
   block_cache_ = std::make_unique<BlockCache>(options_.block_cache_bytes);
   std::filesystem::create_directories(directory_);
   acquire_lock();
   try {
-    discover_tables();
+    open_tables();
     wal_fd_ = ::open(wal_path_.c_str(), O_CREAT | O_RDWR | O_APPEND, 0644);
     if (wal_fd_ < 0) {
       system_error("open WAL");
@@ -842,17 +970,19 @@ void LSMTree::acquire_lock() {
   }
 }
 
-void LSMTree::discover_tables() {
-  tables_.clear();
+void LSMTree::open_tables() {
+  levels_.assign(kMaxLevels, {});
+  compact_pointer_.assign(kMaxLevels, {});
+  std::map<std::uint64_t, std::filesystem::path> files;
   std::vector<std::filesystem::path> abandoned;
   for (const auto& item : std::filesystem::directory_iterator(directory_)) {
     if (!item.is_regular_file()) {
       continue;
     }
     const std::string name = item.path().filename().string();
-    if (name.rfind("sst-", 0) == 0 && item.path().extension() == ".tmp") {
-      // A table that was never renamed into place was never part of the
-      // database; its data is still in the WAL or in the source tables.
+    if ((name.rfind("sst-", 0) == 0 && item.path().extension() == ".tmp") ||
+        name == "MANIFEST.tmp") {
+      // Never renamed into place, so never part of the database.
       abandoned.push_back(item.path());
       continue;
     }
@@ -860,20 +990,151 @@ void LSMTree::discover_tables() {
     if (generation == 0) {
       continue;
     }
-    auto table = load_table(item.path());
-    tables_.push_back(std::move(table));
+    files[generation] = item.path();
     next_generation_ = std::max(next_generation_, generation + 1);
   }
   for (const auto& path : abandoned) {
     std::error_code error;
     std::filesystem::remove(path, error);
   }
-  std::sort(tables_.begin(), tables_.end(),
+
+  const auto manifest = read_manifest(directory_ / "MANIFEST");
+  if (manifest) {
+    // The MANIFEST alone decides which tables are live.
+    next_generation_ = std::max(next_generation_, manifest->next_generation);
+    std::set<std::uint64_t> live;
+    for (const auto& entry : manifest->tables) {
+      const auto file = files.find(entry.generation);
+      if (file == files.end()) {
+        throw std::runtime_error("MANIFEST references missing table sst-" +
+                                 std::to_string(entry.generation) + ".dat");
+      }
+      if (!live.insert(entry.generation).second) {
+        throw std::runtime_error("MANIFEST lists a table twice");
+      }
+      auto table = load_table(file->second);
+      if (table->largest != entry.largest) {
+        throw std::runtime_error("MANIFEST disagrees with " +
+                                 file->second.filename().string());
+      }
+      table->level = entry.level;
+      table->smallest = entry.smallest;
+      levels_[entry.level].push_back(std::move(table));
+    }
+    // Tables missing from the MANIFEST were written by a flush or compaction
+    // that crashed before committing. Their data is still in the WAL or in
+    // the tables the MANIFEST lists, so they are safe to delete.
+    bool removed = false;
+    for (const auto& [generation, path] : files) {
+      if (live.count(generation) == 0) {
+        std::error_code error;
+        removed = std::filesystem::remove(path, error) || removed;
+      }
+    }
+    if (removed) {
+      sync_directory();
+    }
+  } else {
+    // A directory from before the MANIFEST existed: every table is level 0,
+    // ordered by generation exactly as before.
+    for (const auto& [generation, path] : files) {
+      auto table = load_table(path);
+      table->smallest = first_key(*table);
+      levels_[0].push_back(std::move(table));
+    }
+  }
+
+  std::sort(levels_[0].begin(), levels_[0].end(),
             [](const auto& left, const auto& right) {
               return left->generation > right->generation;
             });
-  for (const auto& table : tables_) {
-    sequence_ = std::max(sequence_, table->max_sequence);
+  for (std::size_t level = 1; level < levels_.size(); ++level) {
+    auto& tables = levels_[level];
+    std::sort(tables.begin(), tables.end(),
+              [](const auto& left, const auto& right) {
+                return left->smallest < right->smallest;
+              });
+    for (std::size_t index = 1; index < tables.size(); ++index) {
+      if (!(tables[index - 1]->largest < tables[index]->smallest)) {
+        throw std::runtime_error("overlapping tables in level " +
+                                 std::to_string(level));
+      }
+    }
+  }
+  for (const auto& tables : levels_) {
+    for (const auto& table : tables) {
+      sequence_ = std::max(sequence_, table->max_sequence);
+    }
+  }
+  if (!manifest) {
+    write_manifest(levels_);
+  }
+}
+
+// Atomically replaces MANIFEST: write MANIFEST.tmp, fsync, rename, fsync the
+// directory. A failure before the rename leaves the old MANIFEST in force;
+// a failure after it leaves the outcome unknown, so writes are refused until
+// the database is reopened.
+void LSMTree::write_manifest(const Levels& levels) {
+  std::vector<std::uint8_t> bytes;
+  append_u32(bytes, kManifestMagic);
+  append_u32(bytes, kManifestVersion);
+  append_u64(bytes, next_generation_);
+  std::uint32_t count = 0;
+  for (const auto& tables : levels) {
+    count += static_cast<std::uint32_t>(tables.size());
+  }
+  append_u32(bytes, count);
+  for (std::size_t level = 0; level < levels.size(); ++level) {
+    for (const auto& table : levels[level]) {
+      append_u64(bytes, table->generation);
+      append_u32(bytes, static_cast<std::uint32_t>(level));
+      append_u32(bytes, static_cast<std::uint32_t>(table->smallest.size()));
+      bytes.insert(bytes.end(), table->smallest.begin(), table->smallest.end());
+      append_u32(bytes, static_cast<std::uint32_t>(table->largest.size()));
+      bytes.insert(bytes.end(), table->largest.begin(), table->largest.end());
+    }
+  }
+  append_u32(bytes, crc32(bytes.data(), bytes.size()));
+
+  const auto temporary = directory_ / "MANIFEST.tmp";
+  const auto fail = [&](const char* operation) {
+    const int saved = errno;
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    errno = saved;
+    system_error(operation);
+  };
+  const int fd =
+      ::open(temporary.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    fail("create MANIFEST");
+  }
+  try {
+    write_all(fd, bytes.data(), bytes.size());
+  } catch (...) {
+    ::close(fd);
+    std::error_code ignored;
+    std::filesystem::remove(temporary, ignored);
+    throw;
+  }
+  if (::fsync(fd) != 0) {
+    const int saved = errno;
+    ::close(fd);
+    errno = saved;
+    fail("fsync MANIFEST");
+  }
+  if (::close(fd) != 0) {
+    fail("close MANIFEST");
+  }
+  if (::rename(temporary.c_str(), (directory_ / "MANIFEST").c_str()) != 0) {
+    fail("rename MANIFEST");
+  }
+  try {
+    sync_directory();
+  } catch (...) {
+    failed_ = true;
+    throw;
   }
 }
 
@@ -1005,18 +1266,39 @@ std::optional<std::string> LSMTree::get(const std::string& key) const {
                ? std::nullopt
                : std::optional<std::string>(memory->second.value);
   }
-  for (const auto& table : tables_) {
-    ++bloom_checks_;
-    if (!table->bloom.maybe_contains(key)) {
-      ++bloom_negative_hits_;
-      continue;
+  // Shallower levels hold newer data, and within level 0 newer tables come
+  // first, so the first table that contains the key has its newest version.
+  for (std::size_t level = 0; level < levels_.size(); ++level) {
+    const auto& tables = levels_[level];
+    std::size_t first = 0;
+    std::size_t last = tables.size();
+    if (level > 0) {
+      // Disjoint ranges: at most one table can hold the key.
+      const auto found = std::lower_bound(
+          tables.begin(), tables.end(), key,
+          [](const auto& table, const std::string& target) {
+            return table->largest < target;
+          });
+      if (found == tables.end() || key < (*found)->smallest) {
+        continue;
+      }
+      first = static_cast<std::size_t>(found - tables.begin());
+      last = first + 1;
     }
-    TableCursor cursor(*table, block_cache_.get(), block_reads_);
-    cursor.seek(key);
-    if (cursor.valid() && cursor.key() == key) {
-      return cursor.entry().tombstone
-                 ? std::nullopt
-                 : std::optional<std::string>(cursor.entry().value);
+    for (std::size_t index = first; index < last; ++index) {
+      const Table& table = *tables[index];
+      ++bloom_checks_;
+      if (!table.bloom.maybe_contains(key)) {
+        ++bloom_negative_hits_;
+        continue;
+      }
+      TableCursor cursor(table, block_cache_.get(), block_reads_);
+      cursor.seek(key);
+      if (cursor.valid() && cursor.key() == key) {
+        return cursor.entry().tombstone
+                   ? std::nullopt
+                   : std::optional<std::string>(cursor.entry().value);
+      }
     }
   }
   return std::nullopt;
@@ -1028,14 +1310,21 @@ std::vector<std::pair<std::string, std::string>> LSMTree::scan(
     throw std::invalid_argument("scan end precedes begin");
   }
   std::map<std::string, Entry> latest;
-  for (const auto& table : tables_) {
-    TableCursor cursor(*table, block_cache_.get(), block_reads_);
-    for (cursor.seek(begin);
-         cursor.valid() && (end.empty() || cursor.key() < end); cursor.next()) {
-      const auto current = latest.find(cursor.key());
-      if (current == latest.end() ||
-          current->second.sequence < cursor.entry().sequence) {
-        latest[cursor.key()] = cursor.entry();
+  for (const auto& tables : levels_) {
+    for (const auto& table : tables) {
+      if (table->entry_count == 0 || table->largest < begin ||
+          (!end.empty() && !(table->smallest < end))) {
+        continue;
+      }
+      TableCursor cursor(*table, block_cache_.get(), block_reads_);
+      for (cursor.seek(begin);
+           cursor.valid() && (end.empty() || cursor.key() < end);
+           cursor.next()) {
+        const auto current = latest.find(cursor.key());
+        if (current == latest.end() ||
+            current->second.sequence < cursor.entry().sequence) {
+          latest[cursor.key()] = cursor.entry();
+        }
       }
     }
   }
@@ -1065,16 +1354,6 @@ std::filesystem::path LSMTree::table_path(std::uint64_t generation,
                        (temporary ? ".dat.tmp" : ".dat"));
 }
 
-std::shared_ptr<LSMTree::Table> LSMTree::install_table(
-    const std::filesystem::path& temporary, std::uint64_t generation) {
-  const auto destination = table_path(generation, false);
-  if (::rename(temporary.c_str(), destination.c_str()) != 0) {
-    system_error("rename SSTable");
-  }
-  sync_directory();
-  return load_table(destination);
-}
-
 void LSMTree::flush() {
   if (memtable_.empty()) {
     return;
@@ -1082,45 +1361,230 @@ void LSMTree::flush() {
   require_writable();
   const std::uint64_t generation = next_generation_++;
   const auto temporary = table_path(generation, true);
+  const auto destination = table_path(generation, false);
   build_table(temporary, options_, memtable_.size(), [&](TableWriter& writer) {
     for (const auto& [key, entry] : memtable_) {
       writer.add(key, entry);
     }
   });
-  tables_.insert(tables_.begin(), install_table(temporary, generation));
+  if (::rename(temporary.c_str(), destination.c_str()) != 0) {
+    system_error("rename SSTable");
+  }
+  sync_directory();
+  auto table = load_table(destination);
+  table->smallest = memtable_.begin()->first;
+  Levels next = levels_;
+  next[0].insert(next[0].begin(), std::move(table));
+  // The table is live once the MANIFEST lists it; only then may the WAL that
+  // also holds its data be discarded.
+  write_manifest(next);
+  levels_ = std::move(next);
   reset_wal();
   memtable_.clear();
   memtable_size_ = 0;
-  if (tables_.size() >= options_.compaction_trigger) {
-    compact();
-  }
+  maybe_compact();
 }
 
 void LSMTree::compact() {
-  if (tables_.size() < 2) {
+  std::vector<std::shared_ptr<Table>> inputs;
+  std::size_t target = 1;
+  for (std::size_t level = 0; level < levels_.size(); ++level) {
+    for (const auto& table : levels_[level]) {
+      inputs.push_back(table);
+    }
+    if (level > 0 && !levels_[level].empty()) {
+      target = level;
+    }
+  }
+  if (inputs.size() < 2) {
     return;
   }
   require_writable();
-  std::size_t expected_keys = 0;
-  for (const auto& table : tables_) {
-    expected_keys += static_cast<std::size_t>(table->entry_count);
+  // Everything is an input and nothing lies below the target, so every
+  // tombstone can be dropped.
+  run_compaction(inputs, target);
+}
+
+std::uint64_t LSMTree::level_limit(std::size_t level) const {
+  std::uint64_t limit = options_.level1_bytes;
+  for (std::size_t deeper = 1; deeper < level; ++deeper) {
+    if (limit > std::numeric_limits<std::uint64_t>::max() /
+                    options_.level_multiplier) {
+      return std::numeric_limits<std::uint64_t>::max();
+    }
+    limit *= options_.level_multiplier;
   }
-  const std::uint64_t generation = next_generation_++;
-  const auto temporary = table_path(generation, true);
-  // Streaming k-way merge: each source contributes one block at a time, and
-  // for every key only the newest version (highest sequence) is written.
-  // Tombstones are kept; see "Why compaction retains tombstones".
-  build_table(temporary, options_, expected_keys, [&](TableWriter& writer) {
+  return limit;
+}
+
+void LSMTree::maybe_compact() {
+  for (;;) {
+    if (levels_[0].size() >= options_.compaction_trigger) {
+      compact_level0();
+      continue;
+    }
+    bool compacted = false;
+    // The last level has no size limit.
+    for (std::size_t level = 1; level + 1 < levels_.size(); ++level) {
+      std::uint64_t bytes = 0;
+      for (const auto& table : levels_[level]) {
+        bytes += table->file_bytes;
+      }
+      if (bytes > level_limit(level)) {
+        compact_level(level);
+        compacted = true;
+        break;
+      }
+    }
+    if (!compacted) {
+      return;
+    }
+  }
+}
+
+// Level 0 tables may overlap each other, so all of them move down together,
+// merged with every level 1 table their combined range touches.
+void LSMTree::compact_level0() {
+  std::vector<std::shared_ptr<Table>> inputs = levels_[0];
+  std::string smallest;
+  std::string largest;
+  bool any = false;
+  for (const auto& table : levels_[0]) {
+    if (table->entry_count == 0) {
+      continue;
+    }
+    if (!any || table->smallest < smallest) {
+      smallest = table->smallest;
+    }
+    if (!any || largest < table->largest) {
+      largest = table->largest;
+    }
+    any = true;
+  }
+  if (any) {
+    for (const auto& table : levels_[1]) {
+      if (overlaps(*table, smallest, largest)) {
+        inputs.push_back(table);
+      }
+    }
+  }
+  run_compaction(inputs, 1);
+}
+
+// Moves one table from `level` into level + 1, merging it with the tables
+// there whose ranges overlap it.
+void LSMTree::compact_level(std::size_t level) {
+  const auto& tables = levels_[level];
+  auto chosen = std::find_if(tables.begin(), tables.end(),
+                             [&](const auto& table) {
+                               return compact_pointer_[level] < table->smallest;
+                             });
+  if (chosen == tables.end()) {
+    chosen = tables.begin();
+  }
+  const std::shared_ptr<Table> table = *chosen;
+  compact_pointer_[level] = table->largest;
+
+  std::vector<std::shared_ptr<Table>> inputs{table};
+  for (const auto& below : levels_[level + 1]) {
+    if (overlaps(*below, table->smallest, table->largest)) {
+      inputs.push_back(below);
+    }
+  }
+  if (inputs.size() > 1) {
+    run_compaction(inputs, level + 1);
+    return;
+  }
+  // Nothing overlaps below: move the file down by rewriting only the
+  // MANIFEST.
+  Levels next = levels_;
+  auto& from = next[level];
+  from.erase(std::find(from.begin(), from.end(), table));
+  auto& to = next[level + 1];
+  to.insert(std::upper_bound(to.begin(), to.end(), table,
+                             [](const auto& left, const auto& right) {
+                               return left->smallest < right->smallest;
+                             }),
+            table);
+  write_manifest(next);
+  levels_ = std::move(next);
+  table->level = level + 1;
+}
+
+// True when no level below `level` can hold a version of `key`, so a
+// tombstone written to `level` has nothing left to hide.
+bool LSMTree::is_base_level(std::size_t level, const std::string& key) const {
+  for (std::size_t deeper = level + 1; deeper < levels_.size(); ++deeper) {
+    const auto& tables = levels_[deeper];
+    const auto found = std::lower_bound(
+        tables.begin(), tables.end(), key,
+        [](const auto& table, const std::string& target) {
+          return table->largest < target;
+        });
+    if (found != tables.end() && !(key < (*found)->smallest)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Merges `inputs` into new tables at `output_level`, then swaps them in with
+// one MANIFEST write. Until that write, the inputs remain the live tables;
+// after it, the outputs are. The input files are deleted only afterwards.
+void LSMTree::run_compaction(const std::vector<std::shared_ptr<Table>>& inputs,
+                             std::size_t output_level) {
+  std::uint64_t total_keys = 0;
+  std::uint64_t input_bytes = 0;
+  for (const auto& table : inputs) {
+    total_keys += table->entry_count;
+    input_bytes += table->file_bytes;
+  }
+  // Size each output's Bloom filter for its share of the keys, with slack.
+  const double share =
+      input_bytes == 0 ? 1.0
+                       : std::min(1.0, static_cast<double>(options_.table_bytes) /
+                                           static_cast<double>(input_bytes));
+  const std::uint64_t keys_per_output = std::max<std::uint64_t>(
+      1, std::min<std::uint64_t>(
+             total_keys,
+             static_cast<std::uint64_t>(static_cast<double>(total_keys) *
+                                        share * 1.5) +
+                 16));
+
+  struct Output {
+    std::uint64_t generation;
+    std::filesystem::path temporary;
+    std::string smallest;
+    std::string largest;
+  };
+  std::vector<Output> outputs;
+  std::unique_ptr<TableWriter> writer;
+  const auto finish_output = [&] {
+    writer->finish();
+    compaction_bytes_written_ += writer->bytes_written();
+    writer.reset();
+  };
+  const auto discard_outputs = [&] {
+    writer.reset();
+    for (const auto& output : outputs) {
+      std::error_code ignored;
+      std::filesystem::remove(output.temporary, ignored);
+    }
+  };
+
+  try {
+    // Streaming k-way merge, one block per input, bypassing the block cache.
     std::vector<TableCursor> cursors;
-    cursors.reserve(tables_.size());
-    for (const auto& table : tables_) {
+    cursors.reserve(inputs.size());
+    for (const auto& table : inputs) {
       cursors.emplace_back(*table, nullptr, block_reads_);
       cursors.back().seek("");
     }
     for (;;) {
       const std::string* smallest = nullptr;
       for (const auto& cursor : cursors) {
-        if (cursor.valid() && (smallest == nullptr || cursor.key() < *smallest)) {
+        if (cursor.valid() &&
+            (smallest == nullptr || cursor.key() < *smallest)) {
           smallest = &cursor.key();
         }
       }
@@ -1135,23 +1599,81 @@ void LSMTree::compact() {
           newest = &cursor.entry();
         }
       }
-      writer.add(key, *newest);
+      if (!(newest->tombstone && is_base_level(output_level, key))) {
+        if (!writer) {
+          const std::uint64_t generation = next_generation_++;
+          outputs.push_back({generation, table_path(generation, true), key, key});
+          writer = std::make_unique<TableWriter>(
+              outputs.back().temporary, options_.block_bytes,
+              options_.bloom_bits_per_key, keys_per_output);
+        }
+        writer->add(key, *newest);
+        outputs.back().largest = key;
+        if (writer->bytes_written() >= options_.table_bytes) {
+          finish_output();
+        }
+      }
       for (auto& cursor : cursors) {
         if (cursor.valid() && cursor.key() == key) {
           cursor.next();
         }
       }
     }
-  });
-  auto replacement = install_table(temporary, generation);
-  const auto old_tables = tables_;
-  tables_.assign(1, replacement);
-  for (const auto& table : old_tables) {
-    std::error_code error;
-    std::filesystem::remove(table->path, error);
-    if (error) {
-      throw std::runtime_error("failed to remove compacted SSTable");
+    if (writer) {
+      finish_output();
     }
+  } catch (...) {
+    discard_outputs();
+    throw;
+  }
+
+  // Rename every output into place. Any that are renamed but never reach the
+  // MANIFEST are removed as orphans on the next open.
+  std::vector<std::shared_ptr<Table>> installed;
+  for (std::size_t index = 0; index < outputs.size(); ++index) {
+    const auto destination = table_path(outputs[index].generation, false);
+    if (::rename(outputs[index].temporary.c_str(), destination.c_str()) != 0) {
+      const int saved = errno;
+      for (std::size_t rest = index; rest < outputs.size(); ++rest) {
+        std::error_code ignored;
+        std::filesystem::remove(outputs[rest].temporary, ignored);
+      }
+      errno = saved;
+      system_error("rename SSTable");
+    }
+  }
+  if (!outputs.empty()) {
+    sync_directory();
+  }
+  for (const auto& output : outputs) {
+    auto table = load_table(table_path(output.generation, false));
+    table->level = output_level;
+    table->smallest = output.smallest;
+    installed.push_back(std::move(table));
+  }
+
+  Levels next = levels_;
+  for (auto& tables : next) {
+    tables.erase(std::remove_if(tables.begin(), tables.end(),
+                                [&](const auto& table) {
+                                  return std::find(inputs.begin(), inputs.end(),
+                                                   table) != inputs.end();
+                                }),
+                 tables.end());
+  }
+  auto& level = next[output_level];
+  level.insert(level.end(), installed.begin(), installed.end());
+  std::sort(level.begin(), level.end(), [](const auto& left, const auto& right) {
+    return left->smallest < right->smallest;
+  });
+  write_manifest(next);
+  levels_ = std::move(next);
+
+  // The inputs are no longer live. A file that fails to delete is an orphan
+  // and is removed on the next open.
+  for (const auto& table : inputs) {
+    std::error_code ignored;
+    std::filesystem::remove(table->path, ignored);
   }
   sync_directory();
 }
@@ -1187,8 +1709,19 @@ void LSMTree::sync_directory() const {
 }
 
 Stats LSMTree::stats() const {
-  return {memtable_.size(), tables_.size(), sequence_, bloom_checks_,
-          bloom_negative_hits_, block_reads_, block_cache_->hits};
+  Stats stats;
+  stats.memtable_entries = memtable_.size();
+  stats.sequence = sequence_;
+  stats.bloom_checks = bloom_checks_;
+  stats.bloom_negative_hits = bloom_negative_hits_;
+  stats.block_reads = block_reads_;
+  stats.block_cache_hits = block_cache_->hits;
+  stats.compaction_bytes_written = compaction_bytes_written_;
+  for (const auto& tables : levels_) {
+    stats.tables_per_level.push_back(tables.size());
+    stats.sstable_count += tables.size();
+  }
+  return stats;
 }
 
 }  // namespace lsm
