@@ -24,6 +24,20 @@ jobs:
       - name: Run benchmark smoke test
         run: make benchmark
 
+  sanitizers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: AddressSanitizer and UBSan
+        run: make asan-test CXX=clang++
+      # ThreadSanitizer cannot map its shadow memory with the runners'
+      # default 32 bits of mmap randomization.
+      - name: Allow ThreadSanitizer's memory layout
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: ThreadSanitizer
+        run: make tsan-test CXX=clang++
+
   java:
     strategy:
       matrix:

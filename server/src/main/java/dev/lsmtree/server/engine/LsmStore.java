@@ -12,7 +12,7 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static java.lang.foreign.ValueLayout.ADDRESS;
 import static java.lang.foreign.ValueLayout.JAVA_BYTE;
@@ -23,8 +23,9 @@ import static java.lang.foreign.ValueLayout.JAVA_LONG;
  * Java view of the C++ engine, called through the Foreign Function & Memory
  * API (see bindings/lsm_c.h).
  *
- * <p>The engine is single-threaded, so every call takes one lock. Writes are
- * serialized by the engine's fsync anyway, so the lock costs little.
+ * <p>The engine is thread-safe: reads run in parallel and writes are ordered
+ * inside it. Calls therefore share a read lock; only {@link #close()} takes
+ * the write lock, so the native handle is never freed while a call uses it.
  */
 public final class LsmStore implements AutoCloseable {
 
@@ -42,8 +43,8 @@ public final class LsmStore implements AutoCloseable {
   private final MethodHandle statsHandle;
   private final MethodHandle freeHandle;
 
-  private final ReentrantLock lock = new ReentrantLock();
-  private MemorySegment database; // guarded by lock; NULL once closed
+  private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
+  private MemorySegment database; // written under the write lock; NULL once closed
 
   private LsmStore(SymbolLookup library, Path directory, LsmOptions options) {
     Linker linker = Linker.nativeLinker();
@@ -190,7 +191,7 @@ public final class LsmStore implements AutoCloseable {
   /** Closes the engine, releasing its directory lock. Safe to call twice. */
   @Override
   public void close() {
-    lock.lock();
+    lock.writeLock().lock();
     try {
       if (database == null || database.equals(MemorySegment.NULL)) {
         return;
@@ -200,7 +201,7 @@ public final class LsmStore implements AutoCloseable {
       throw new LsmException("failed to call lsm_close", throwable);
     } finally {
       database = MemorySegment.NULL;
-      lock.unlock();
+      lock.writeLock().unlock();
     }
   }
 
@@ -210,7 +211,7 @@ public final class LsmStore implements AutoCloseable {
   }
 
   private <T> T call(NativeCall<T> body) {
-    lock.lock();
+    lock.readLock().lock();
     try (Arena arena = Arena.ofConfined()) {
       if (database == null || database.equals(MemorySegment.NULL)) {
         throw new IllegalStateException("LSM store is closed");
@@ -221,7 +222,7 @@ public final class LsmStore implements AutoCloseable {
     } catch (Throwable throwable) {
       throw new LsmException("native call failed", throwable);
     } finally {
-      lock.unlock();
+      lock.readLock().unlock();
     }
   }
 
