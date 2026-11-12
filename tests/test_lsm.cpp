@@ -459,7 +459,7 @@ void test_version1_table_is_read_and_migrated() {
     database.compact();
     const auto files = table_files(directory);
     CHECK(files.size() == 1);
-    CHECK(!files.empty() && table_version(files.front()) == 2);
+    CHECK(!files.empty() && table_version(files.front()) == 3);
   }
   {
     lsm::LSMTree database(directory);
@@ -944,6 +944,155 @@ void test_version1_manifest_is_upgraded() {
   reset(directory);
 }
 
+// Hand-builds a one-block table in the version 2 format written by earlier
+// releases: [header | block (fixed entries + CRC) | index + CRC | Bloom |
+// 64-byte footer].
+void write_v2_table(const std::filesystem::path& path) {
+  struct Row {
+    std::uint64_t sequence;
+    bool tombstone;
+    std::string key;
+    std::string value;
+  };
+  const std::vector<Row> rows = {{1, false, "alpha", "one"},
+                                 {2, true, "beta", ""},
+                                 {3, false, "gamma", "three"}};
+  const auto crc = [](const std::string& bytes) {
+    return lsm::crc32(reinterpret_cast<const std::uint8_t*>(bytes.data()),
+                      bytes.size());
+  };
+  std::string block;
+  for (const auto& row : rows) {
+    put_u64(block, row.sequence);
+    block.push_back(row.tombstone ? 1 : 0);
+    block.append(3, '\0');
+    put_u32(block, static_cast<std::uint32_t>(row.key.size()));
+    put_u32(block, static_cast<std::uint32_t>(row.value.size()));
+    block += row.key;
+    block += row.value;
+  }
+  put_u32(block, crc(block));
+  std::string index;
+  put_u32(index, 5);
+  index += "gamma";
+  put_u64(index, 8);
+  put_u32(index, static_cast<std::uint32_t>(block.size()));
+  put_u32(index, crc(index));
+  const std::string bloom(8, static_cast<char>(0xFF));  // "maybe" for all
+  std::string bytes;
+  put_u32(bytes, 0x31545353U);  // SST1
+  put_u32(bytes, 2);            // version 2
+  bytes += block;
+  const std::uint64_t index_offset = bytes.size();
+  bytes += index;
+  const std::uint64_t bloom_offset = bytes.size();
+  bytes += bloom;
+  std::string footer;
+  put_u64(footer, index_offset);
+  put_u64(footer, index.size());
+  put_u64(footer, bloom_offset);
+  put_u64(footer, bloom.size());
+  put_u64(footer, rows.size());
+  put_u64(footer, 3);   // max sequence
+  put_u32(footer, 64);  // Bloom bits
+  put_u32(footer, 1);   // Bloom hashes
+  put_u32(footer, 0x46545353U);
+  put_u32(footer, crc(footer));
+  bytes += footer;
+  write_file(path, bytes);
+}
+
+void test_version2_table_is_read_and_migrated() {
+  const auto directory = test_directory("v2-table");
+  reset(directory);
+  std::filesystem::create_directories(directory);
+  write_v2_table(directory / "sst-1.dat");
+  {
+    lsm::LSMTree database(directory);
+    CHECK(database.get("alpha") == std::optional<std::string>("one"));
+    CHECK(!database.get("beta"));
+    CHECK(database.get("gamma") == std::optional<std::string>("three"));
+    const std::vector<std::pair<std::string, std::string>> expected = {
+        {"alpha", "one"}, {"gamma", "three"}};
+    CHECK(database.scan("", "") == expected);
+    CHECK(database.stats().sequence == 3);
+    database.put("delta", "four");
+    database.flush();
+    database.compact();
+    const auto files = table_files(directory);
+    CHECK(files.size() == 1);
+    CHECK(!files.empty() && table_version(files.front()) == 3);
+  }
+  lsm::LSMTree database(directory);
+  CHECK(database.get("alpha") == std::optional<std::string>("one"));
+  CHECK(database.get("delta") == std::optional<std::string>("four"));
+  CHECK(!database.get("beta"));
+  reset(directory);
+}
+
+void test_prefix_compression_shrinks_tables() {
+  const auto directory = test_directory("prefix");
+  reset(directory);
+  lsm::Options options;
+  options.memtable_bytes = 1 << 20;
+  std::size_t raw_bytes = 0;
+  {
+    lsm::LSMTree database(directory, options);
+    for (int index = 0; index < 2000; ++index) {
+      const std::string key = "customer:profile:" + numbered("", index);
+      const std::string value = "v" + std::to_string(index);
+      database.put(key, value);
+      raw_bytes += key.size() + value.size();
+    }
+    database.flush();
+  }
+  const auto files = table_files(directory);
+  CHECK(files.size() == 1);
+  // The previous format spent 20 bytes per entry on headers and stored every
+  // key whole, so its tables were larger than the raw data. Shared prefixes
+  // and varint lengths bring this one well below it.
+  CHECK(!files.empty() && std::filesystem::file_size(files.front()) <
+                              raw_bytes * 7 / 10);
+  reset(directory);
+}
+
+void test_restart_points_find_every_key() {
+  const auto directory = test_directory("restarts");
+  reset(directory);
+  lsm::Options options;
+  options.memtable_bytes = 1 << 20;
+  options.block_bytes = 1 << 20;  // One block with many restart points.
+  options.block_cache_bytes = 0;  // Every lookup searches the raw block.
+  {
+    lsm::LSMTree database(directory, options);
+    for (int index = 0; index < 1000; index += 2) {
+      database.put(numbered("key-", index), std::to_string(index));
+    }
+    database.flush();
+  }
+  lsm::LSMTree database(directory, options);
+  for (int index = 0; index < 1000; ++index) {
+    const auto value = database.get(numbered("key-", index));
+    if (index % 2 == 0) {
+      CHECK(value == std::optional<std::string>(std::to_string(index)));
+    } else {
+      CHECK(!value);  // Falls between two stored keys.
+    }
+  }
+  CHECK(!database.get("key-"));       // Before the first key.
+  CHECK(!database.get("key-9999"));   // After the last key.
+  // Ranges that start and end in the middle of restart segments.
+  for (int begin = 1; begin < 1000; begin += 37) {
+    const auto page = database.scan(numbered("key-", begin), numbered("key-", begin + 41));
+    std::size_t expected = 0;
+    for (int index = begin; index < begin + 41 && index < 1000; ++index) {
+      expected += index % 2 == 0 ? 1 : 0;
+    }
+    CHECK(page.size() == expected);
+  }
+  reset(directory);
+}
+
 }  // namespace
 
 int main() {
@@ -973,6 +1122,9 @@ int main() {
   test_torn_manifest_tail_is_ignored();
   test_corrupt_manifest_record_before_tail_fails_open();
   test_version1_manifest_is_upgraded();
+  test_version2_table_is_read_and_migrated();
+  test_prefix_compression_shrinks_tables();
+  test_restart_points_find_every_key();
   if (failures != 0) {
     std::cerr << failures << " of " << assertions << " assertions failed\n";
     return 1;
