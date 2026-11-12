@@ -18,6 +18,9 @@ jobs:
         run: make test
       - name: Run short crash campaign
         run: make crash-test CRASH_ROUNDS=30
+      - name: Run short power-cut campaign
+        if: runner.os == 'Linux'
+        run: make powercut-test POWERCUT_ROUNDS=50
       - name: Run benchmark smoke test
         run: make benchmark
 

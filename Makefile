@@ -22,7 +22,7 @@ endif
 PIC_DIR := $(BUILD_DIR)/pic
 SHARED_LIB := $(BUILD_DIR)/liblsm.$(SHARED_EXT)
 
-.PHONY: all shared test crash-test benchmark java-test server smoke-test clean
+.PHONY: all shared test crash-test powercut-test benchmark java-test server smoke-test clean
 
 all: $(TOOL)
 
@@ -61,6 +61,21 @@ crash-test: $(TOOL)
 
 benchmark: $(TOOL)
 	./$(TOOL) benchmark $(BUILD_DIR)/benchmark.db 20000
+
+POWERCUT_LIB := $(BUILD_DIR)/powercut.so
+POWERCUT_SNAPSHOT := $(BUILD_DIR)/powercut_snapshot
+
+$(POWERCUT_LIB): scripts/powercut/powercut.c | $(BUILD_DIR)
+	$(CC) -O2 -Wall -Wextra -Werror -shared -fPIC $< -o $@ -ldl
+
+$(POWERCUT_SNAPSHOT): scripts/powercut/powercut.c | $(BUILD_DIR)
+	$(CC) -O2 -Wall -Wextra -Werror -DPOWERCUT_MAIN $< -o $@
+
+# Linux only: simulated power loss via an LD_PRELOAD fsync shim.
+powercut-test: $(TOOL) $(POWERCUT_LIB) $(POWERCUT_SNAPSHOT)
+	python3 scripts/powercut_torture.py --binary ./$(TOOL) \
+		--preload ./$(POWERCUT_LIB) --snapshot ./$(POWERCUT_SNAPSHOT) \
+		--rounds $${POWERCUT_ROUNDS:-100}
 
 java-test: $(SHARED_LIB)
 	cd server && mvn -B -q verify
