@@ -51,6 +51,7 @@ class LSMTree {
  private:
   void mutate(const std::string& key, const std::string& value,
               bool tombstone);
+  void acquire_lock();
   void discover_tables();
   void recover_wal();
   std::shared_ptr<Table> write_table(
@@ -63,6 +64,8 @@ class LSMTree {
   std::filesystem::path wal_path_;
   Options options_;
   int wal_fd_ = -1;
+  // Holds an exclusive flock on <directory>/LOCK for the object's lifetime.
+  int lock_fd_ = -1;
   // Byte length of the WAL up to the end of its last complete record.
   std::uint64_t wal_size_ = 0;
   // Set when an I/O error leaves the on-disk state uncertain; all further
