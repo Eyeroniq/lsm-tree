@@ -1076,6 +1076,10 @@ LSMTree::LSMTree(std::filesystem::path directory, Options options)
     if (wal_fd_ < 0) {
       system_error("open WAL");
     }
+    // A newly created WAL's name is not durable until its directory is
+    // fsynced; without this, every write acknowledged before the first flush
+    // could vanish in a power cut even though the WAL itself was fsynced.
+    sync_directory();
     recover_wal();
   } catch (...) {
     if (wal_fd_ >= 0) {
