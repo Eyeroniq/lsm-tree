@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <limits>
 #include <list>
 #include <mutex>
+#include <thread>
 #include <set>
 #include <stdexcept>
 #include <sys/file.h>
@@ -319,6 +321,7 @@ struct LSMTree::BlockCache {
   explicit BlockCache(std::size_t capacity_bytes) : capacity(capacity_bytes) {}
 
   std::shared_ptr<const RawBlock> find(const Key& key) {
+    std::lock_guard<std::mutex> guard(mutex);
     const auto found = slots.find(key);
     if (found == slots.end()) {
       return nullptr;
@@ -330,6 +333,7 @@ struct LSMTree::BlockCache {
 
   void insert(const Key& key, std::shared_ptr<const RawBlock> block,
               std::size_t charge) {
+    std::lock_guard<std::mutex> guard(mutex);
     if (charge > capacity || slots.count(key) != 0) {
       return;
     }
@@ -343,9 +347,10 @@ struct LSMTree::BlockCache {
     }
   }
 
+  std::mutex mutex;
   std::size_t capacity;
   std::size_t used = 0;
-  std::uint64_t hits = 0;
+  std::atomic<std::uint64_t> hits{0};
   std::list<Slot> lru;  // Most recently used first.
   std::map<Key, std::list<Slot>::iterator> slots;
 };
@@ -873,7 +878,7 @@ std::shared_ptr<const RawBlock> read_block(const Table& table,
 class TableCursor {
  public:
   TableCursor(const Table& table, LSMTree::BlockCache* cache,
-              std::uint64_t& block_reads)
+              std::atomic<std::uint64_t>& block_reads)
       : table_(table), cache_(cache), block_reads_(block_reads) {}
 
   // Positions at the first entry whose key is >= target.
@@ -960,7 +965,7 @@ class TableCursor {
 
   const Table& table_;
   LSMTree::BlockCache* cache_;
-  std::uint64_t& block_reads_;
+  std::atomic<std::uint64_t>& block_reads_;
   std::size_t block_ = 0;
   std::size_t position_ = 0;
   BlockIterator iterator_;
@@ -1333,7 +1338,7 @@ std::optional<Manifest> read_manifest(const std::filesystem::path& path) {
 
 // Smallest key of a table, reading its first block if necessary.
 std::string first_key(const Table& table) {
-  std::uint64_t ignored = 0;
+  std::atomic<std::uint64_t> ignored{0};
   TableCursor cursor(table, nullptr, ignored);
   cursor.seek("");
   return cursor.valid() ? cursor.key() : std::string();
@@ -1377,9 +1382,7 @@ Snapshot::~Snapshot() {
 }
 
 LSMTree::LSMTree(std::filesystem::path directory, Options options)
-    : directory_(std::move(directory)),
-      wal_path_(directory_ / "active.wal"),
-      options_(options) {
+    : directory_(std::move(directory)), options_(options) {
   if (options_.memtable_bytes == 0 || options_.bloom_bits_per_key == 0 ||
       options_.compaction_trigger < 2 || options_.block_bytes == 0 ||
       options_.table_bytes == 0 || options_.level1_bytes == 0 ||
@@ -1392,15 +1395,7 @@ LSMTree::LSMTree(std::filesystem::path directory, Options options)
   acquire_lock();
   try {
     open_tables();
-    wal_fd_ = ::open(wal_path_.c_str(), O_CREAT | O_RDWR | O_APPEND, 0644);
-    if (wal_fd_ < 0) {
-      system_error("open WAL");
-    }
-    // A newly created WAL's name is not durable until its directory is
-    // fsynced; without this, every write acknowledged before the first flush
-    // could vanish in a power cut even though the WAL itself was fsynced.
-    sync_directory();
-    recover_wal();
+    open_wals();
   } catch (...) {
     if (wal_fd_ >= 0) {
       ::close(wal_fd_);
@@ -1414,9 +1409,21 @@ LSMTree::LSMTree(std::filesystem::path directory, Options options)
     lock_fd_ = -1;
     throw;
   }
+  published_ = std::make_shared<const Levels>(levels_);
+  worker_ = std::thread([this] { background_loop(); });
 }
 
 LSMTree::~LSMTree() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stopping_ = true;
+  }
+  work_cv_.notify_all();
+  // Finishes the current flush or compaction step, if any. A memtable still
+  // waiting to be flushed needs nothing: its WAL is replayed on open.
+  if (worker_.joinable()) {
+    worker_.join();
+  }
   if (wal_fd_ >= 0) {
     ::close(wal_fd_);
   }
@@ -1637,7 +1644,7 @@ void LSMTree::rewrite_manifest() {
 // removed, tables added or moved to another level) and fsyncing it. The edit
 // is the commit point: before its fsync the old tables are live, after it the
 // new ones are.
-void LSMTree::commit(Levels next) {
+void LSMTree::commit(Levels next, bool flushed_memtable) {
   std::map<std::uint64_t, std::size_t> before;
   for (std::size_t level = 0; level < levels_.size(); ++level) {
     for (const auto& table : levels_[level]) {
@@ -1695,6 +1702,14 @@ void LSMTree::commit(Levels next) {
   }
   manifest_bytes_ += record.size();
   levels_ = std::move(next);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    published_ = std::make_shared<const Levels>(levels_);
+    if (flushed_memtable) {
+      immutable_.reset();
+      immutable_wals_.clear();
+    }
+  }
 
   if (manifest_bytes_ >= kManifestRewriteBytes &&
       manifest_bytes_ > 4 * manifest_snapshot_bytes_) {
@@ -1710,61 +1725,138 @@ void LSMTree::commit(Levels next) {
   }
 }
 
-void LSMTree::recover_wal() {
-  struct stat info {};
-  if (::fstat(wal_fd_, &info) != 0) {
-    system_error("fstat WAL");
-  }
-  const std::uint64_t file_size = static_cast<std::uint64_t>(info.st_size);
-  std::uint64_t offset = 0;
-  while (offset < file_size) {
-    if (file_size - offset < kWalHeader) {
-      break;
+// Each memtable has its own WAL file, wal-N.log, so flushing a memtable can
+// delete exactly the logs that hold its data. A legacy active.wal is log 0.
+std::filesystem::path LSMTree::wal_path(std::uint64_t number) const {
+  return number == 0 ? directory_ / "active.wal"
+                     : directory_ / ("wal-" + std::to_string(number) + ".log");
+}
+
+// Replays every WAL in log order into the memtable, then starts a new log
+// for new writes. The replayed logs stay until that memtable is flushed.
+void LSMTree::open_wals() {
+  std::vector<std::uint64_t> numbers;
+  for (const auto& item : std::filesystem::directory_iterator(directory_)) {
+    if (!item.is_regular_file()) {
+      continue;
     }
-    std::vector<std::uint8_t> header(kWalHeader);
-    if (!read_exact(wal_fd_, offset, header.data(), header.size())) {
-      break;
+    const std::string name = item.path().filename().string();
+    if (name == "active.wal") {
+      numbers.push_back(0);
+      continue;
     }
-    const std::uint32_t magic = read_u32(header.data());
-    const std::uint64_t sequence = read_u64(header.data() + 4);
-    const std::uint8_t type = header[12];
-    const std::uint32_t key_length = read_u32(header.data() + 16);
-    const std::uint32_t value_length = read_u32(header.data() + 20);
-    const std::uint64_t record_size =
-        kWalHeader + static_cast<std::uint64_t>(key_length) +
-        static_cast<std::uint64_t>(value_length) + kChecksum;
-    if (magic != kWalMagic || sequence == 0 || (type != 1 && type != 2) ||
-        header[13] != 0 || header[14] != 0 || header[15] != 0 ||
-        key_length == 0 || key_length > kMaxKey || value_length > kMaxValue ||
-        (type == 2 && value_length != 0) ||
-        record_size > file_size - offset ||
-        record_size > std::numeric_limits<std::size_t>::max()) {
-      break;
-    }
-    std::vector<std::uint8_t> record(static_cast<std::size_t>(record_size));
-    if (!read_exact(wal_fd_, offset, record.data(), record.size())) {
-      break;
-    }
-    const std::uint32_t stored =
-        read_u32(record.data() + record.size() - kChecksum);
-    if (crc32(record.data(), record.size() - kChecksum) != stored) {
-      break;
-    }
-    const char* payload =
-        reinterpret_cast<const char*>(record.data() + kWalHeader);
-    std::string key(payload, key_length);
-    std::string value(payload + key_length, value_length);
-    insert_memtable(key, Entry{sequence, type == 2, std::move(value)});
-    sequence_ = std::max(sequence_, sequence);
-    offset += record_size;
-  }
-  if (offset != file_size) {
-    if (::ftruncate(wal_fd_, static_cast<off_t>(offset)) != 0 ||
-        ::fsync(wal_fd_) != 0) {
-      system_error("repair WAL");
+    if (name.size() > 8 && name.rfind("wal-", 0) == 0 &&
+        name.compare(name.size() - 4, 4, ".log") == 0) {
+      const std::string digits = name.substr(4, name.size() - 8);
+      if (std::all_of(digits.begin(), digits.end(), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+          }) &&
+          digits.size() <= 19) {
+        numbers.push_back(std::stoull(digits));
+      }
     }
   }
-  wal_size_ = offset;
+  std::sort(numbers.begin(), numbers.end());
+  for (const std::uint64_t number : numbers) {
+    recover_wal(wal_path(number));
+    memtable_wals_.push_back(number);
+    wal_number_ = std::max(wal_number_, number);
+  }
+  rotate_wal();
+}
+
+// Starts a new WAL file and makes its name durable before any write in it
+// can be acknowledged. Called by the constructor, or by a writer holding
+// write_mutex_ and mutex_.
+void LSMTree::rotate_wal() {
+  const std::uint64_t number = wal_number_ + 1;
+  const auto path = wal_path(number);
+  const int fd =
+      ::open(path.c_str(), O_CREAT | O_RDWR | O_APPEND | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    system_error("create WAL");
+  }
+  try {
+    sync_directory();
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
+  if (wal_fd_ >= 0) {
+    ::close(wal_fd_);
+  }
+  wal_fd_ = fd;
+  wal_size_ = 0;
+  wal_number_ = number;
+  memtable_wals_.push_back(number);
+}
+
+// Replays the verified prefix of one WAL file into the memtable and
+// truncates anything after it (a torn tail).
+void LSMTree::recover_wal(const std::filesystem::path& path) {
+  const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    system_error("open WAL");
+  }
+  try {
+    struct stat info {};
+    if (::fstat(fd, &info) != 0) {
+      system_error("fstat WAL");
+    }
+    const std::uint64_t file_size = static_cast<std::uint64_t>(info.st_size);
+    std::uint64_t offset = 0;
+    while (offset < file_size) {
+      if (file_size - offset < kWalHeader) {
+        break;
+      }
+      std::vector<std::uint8_t> header(kWalHeader);
+      if (!read_exact(fd, offset, header.data(), header.size())) {
+        break;
+      }
+      const std::uint32_t magic = read_u32(header.data());
+      const std::uint64_t sequence = read_u64(header.data() + 4);
+      const std::uint8_t type = header[12];
+      const std::uint32_t key_length = read_u32(header.data() + 16);
+      const std::uint32_t value_length = read_u32(header.data() + 20);
+      const std::uint64_t record_size =
+          kWalHeader + static_cast<std::uint64_t>(key_length) +
+          static_cast<std::uint64_t>(value_length) + kChecksum;
+      if (magic != kWalMagic || sequence == 0 || (type != 1 && type != 2) ||
+          header[13] != 0 || header[14] != 0 || header[15] != 0 ||
+          key_length == 0 || key_length > kMaxKey || value_length > kMaxValue ||
+          (type == 2 && value_length != 0) ||
+          record_size > file_size - offset ||
+          record_size > std::numeric_limits<std::size_t>::max()) {
+        break;
+      }
+      std::vector<std::uint8_t> record(static_cast<std::size_t>(record_size));
+      if (!read_exact(fd, offset, record.data(), record.size())) {
+        break;
+      }
+      const std::uint32_t stored =
+          read_u32(record.data() + record.size() - kChecksum);
+      if (crc32(record.data(), record.size() - kChecksum) != stored) {
+        break;
+      }
+      const char* payload =
+          reinterpret_cast<const char*>(record.data() + kWalHeader);
+      std::string key(payload, key_length);
+      std::string value(payload + key_length, value_length);
+      insert_memtable(key, Entry{sequence, type == 2, std::move(value)});
+      sequence_ = std::max(sequence_, sequence);
+      offset += record_size;
+    }
+    if (offset != file_size) {
+      if (::ftruncate(fd, static_cast<off_t>(offset)) != 0 ||
+          ::fsync(fd) != 0) {
+        system_error("repair WAL");
+      }
+    }
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
+  ::close(fd);
 }
 
 void LSMTree::put(const std::string& key, const std::string& value) {
@@ -1778,7 +1870,11 @@ void LSMTree::mutate(const std::string& key, const std::string& value,
   if (key.empty() || key.size() > kMaxKey || value.size() > kMaxValue) {
     throw std::invalid_argument("invalid key or value length");
   }
+  // Writers take turns; readers are never blocked by a writer's fsync.
+  std::lock_guard<std::mutex> writer(write_mutex_);
   require_writable();
+  make_room();
+  // Only writers change sequence_, and this one holds write_mutex_.
   const std::uint64_t sequence = sequence_ + 1;
   std::vector<std::uint8_t> record;
   record.reserve(kWalHeader + key.size() + value.size() + kChecksum);
@@ -1809,11 +1905,48 @@ void LSMTree::mutate(const std::string& key, const std::string& value,
     system_error("fsync WAL");
   }
   wal_size_ += record.size();
-  sequence_ = sequence;
 
+  std::lock_guard<std::mutex> lock(mutex_);
+  sequence_ = sequence;
   insert_memtable(key, Entry{sequence, tombstone, value});
-  if (memtable_size_ >= options_.memtable_bytes) {
-    flush();
+}
+
+// With write_mutex_ held: if the memtable is full, hands it to the
+// background thread, first waiting for the previous one to be flushed.
+void LSMTree::make_room() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (memtable_size_ < options_.memtable_bytes) {
+    return;
+  }
+  done_cv_.wait(lock, [&] {
+    return immutable_ == nullptr || background_error_ != nullptr;
+  });
+  rethrow_background_error();
+  switch_memtable();
+}
+
+// With write_mutex_ and mutex_ held: freezes the memtable for the background
+// thread and starts a new memtable with its own WAL.
+void LSMTree::switch_memtable() {
+  std::vector<std::uint64_t> frozen_wals = memtable_wals_;
+  memtable_wals_.clear();
+  try {
+    rotate_wal();
+  } catch (...) {
+    memtable_wals_ = std::move(frozen_wals);
+    throw;
+  }
+  immutable_ = std::make_shared<const Memtable>(std::move(memtable_));
+  immutable_wals_ = std::move(frozen_wals);
+  memtable_ = Memtable();
+  memtable_size_ = 0;
+  work_cv_.notify_one();
+}
+
+// With mutex_ held.
+void LSMTree::rethrow_background_error() const {
+  if (background_error_ != nullptr) {
+    std::rethrow_exception(background_error_);
   }
 }
 
@@ -1840,15 +1973,17 @@ void LSMTree::insert_memtable(const std::string& key, Entry entry) {
 }
 
 std::shared_ptr<const Snapshot> LSMTree::snapshot() const {
+  std::lock_guard<std::mutex> lock(mutex_);
   return std::shared_ptr<const Snapshot>(new Snapshot(sequence_, snapshots_));
 }
 
 std::uint64_t LSMTree::smallest_snapshot() const {
+  std::lock_guard<std::mutex> lock(mutex_);
   return snapshots_->smallest(sequence_);
 }
 
 std::optional<std::string> LSMTree::get(const std::string& key) const {
-  return read(key, sequence_);
+  return read(key, std::numeric_limits<std::uint64_t>::max());
 }
 
 std::optional<std::string> LSMTree::get(const std::string& key,
@@ -1857,19 +1992,37 @@ std::optional<std::string> LSMTree::get(const std::string& key,
 }
 
 // Returns the newest version of `key` with a sequence no greater than `at`.
+// Only the in-memory table is searched under the lock; the frozen memtable
+// and the tables are pinned and searched without it.
 std::optional<std::string> LSMTree::read(const std::string& key,
                                          std::uint64_t at) const {
-  // Versions of a key sort newest first, so this finds the newest visible.
-  const auto memory = memtable_.lower_bound({key, at});
-  if (memory != memtable_.end() && memory->first.first == key) {
-    return memory->second.tombstone
-               ? std::nullopt
-               : std::optional<std::string>(memory->second.value);
+  std::shared_ptr<const Memtable> frozen;
+  std::shared_ptr<const Levels> version;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Versions of a key sort newest first, so this finds the newest visible.
+    const auto memory = memtable_.lower_bound({key, at});
+    if (memory != memtable_.end() && memory->first.first == key) {
+      return memory->second.tombstone
+                 ? std::nullopt
+                 : std::optional<std::string>(memory->second.value);
+    }
+    frozen = immutable_;
+    version = published_;
+  }
+  if (frozen != nullptr) {
+    const auto memory = frozen->lower_bound({key, at});
+    if (memory != frozen->end() && memory->first.first == key) {
+      return memory->second.tombstone
+                 ? std::nullopt
+                 : std::optional<std::string>(memory->second.value);
+    }
   }
   // Shallower levels hold newer data, and within level 0 newer tables come
   // first, so the first table with a visible version has the newest one.
-  for (std::size_t level = 0; level < levels_.size(); ++level) {
-    const auto& tables = levels_[level];
+  const Levels& levels = *version;
+  for (std::size_t level = 0; level < levels.size(); ++level) {
+    const auto& tables = levels[level];
     std::size_t first = 0;
     std::size_t last = tables.size();
     if (level > 0) {
@@ -1911,7 +2064,7 @@ std::optional<std::string> LSMTree::read(const std::string& key,
 
 std::vector<std::pair<std::string, std::string>> LSMTree::scan(
     const std::string& begin, const std::string& end) const {
-  return scan_at(begin, end, sequence_);
+  return scan_at(begin, end, std::numeric_limits<std::uint64_t>::max());
 }
 
 std::vector<std::pair<std::string, std::string>> LSMTree::scan(
@@ -1936,7 +2089,32 @@ std::vector<std::pair<std::string, std::string>> LSMTree::scan_at(
       latest[key] = entry;
     }
   };
-  for (const auto& tables : levels_) {
+  const auto offer_memtable = [&](const Memtable& memtable) {
+    for (auto iterator = memtable.lower_bound(
+             {begin, std::numeric_limits<std::uint64_t>::max()});
+         iterator != memtable.end() &&
+         (end.empty() || iterator->first.first < end);
+         ++iterator) {
+      offer(iterator->first.first, iterator->second);
+    }
+  };
+  std::shared_ptr<const Memtable> frozen;
+  std::shared_ptr<const Levels> version;
+  {
+    // One consistent cut: the live memtable is read, and the frozen
+    // memtable and tables pinned, under the same lock.
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (at == std::numeric_limits<std::uint64_t>::max()) {
+      at = sequence_;
+    }
+    offer_memtable(memtable_);
+    frozen = immutable_;
+    version = published_;
+  }
+  if (frozen != nullptr) {
+    offer_memtable(*frozen);
+  }
+  for (const auto& tables : *version) {
     for (const auto& table : tables) {
       if (table->entry_count == 0 || table->largest < begin ||
           (!end.empty() && !(table->smallest < end))) {
@@ -1949,13 +2127,6 @@ std::vector<std::pair<std::string, std::string>> LSMTree::scan_at(
         offer(cursor.key(), cursor.entry());
       }
     }
-  }
-  for (auto iterator = memtable_.lower_bound(
-           {begin, std::numeric_limits<std::uint64_t>::max()});
-       iterator != memtable_.end() &&
-       (end.empty() || iterator->first.first < end);
-       ++iterator) {
-    offer(iterator->first.first, iterator->second);
   }
   std::vector<std::pair<std::string, std::string>> output;
   output.reserve(latest.size());
@@ -1973,50 +2144,147 @@ std::filesystem::path LSMTree::table_path(std::uint64_t generation,
                        (temporary ? ".dat.tmp" : ".dat"));
 }
 
+// Makes everything written so far part of a table: freezes the memtable and
+// waits for the background thread to flush it.
 void LSMTree::flush() {
+  std::lock_guard<std::mutex> writer(write_mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
+  const auto flushed = [&] {
+    return immutable_ == nullptr || background_error_ != nullptr;
+  };
+  done_cv_.wait(lock, flushed);
+  rethrow_background_error();
   if (memtable_.empty()) {
     return;
   }
   require_writable();
-  const std::uint64_t generation = next_generation_++;
-  const auto temporary = table_path(generation, true);
-  const auto destination = table_path(generation, false);
-  const std::uint64_t oldest_reader = smallest_snapshot();
-  build_table(temporary, options_, memtable_.size(), [&](TableWriter& writer) {
-    const std::string* current = nullptr;
-    std::uint64_t newer = 0;
-    for (const auto& [internal, entry] : memtable_) {
-      if (current == nullptr || internal.first != *current) {
-        current = &internal.first;
-        newer = std::numeric_limits<std::uint64_t>::max();
-      }
-      // A version whose newer version is visible to every reader is hidden
-      // from all of them.
-      const bool hidden = newer <= oldest_reader;
-      newer = internal.second;
-      if (!hidden) {
-        writer.add(internal.first, entry);
-      }
-    }
-  });
-  if (::rename(temporary.c_str(), destination.c_str()) != 0) {
-    system_error("rename SSTable");
-  }
-  sync_directory();
-  auto table = load_table(destination);
-  table->smallest = memtable_.begin()->first.first;
-  Levels next = levels_;
-  next[0].insert(next[0].begin(), std::move(table));
-  // The table is live once the MANIFEST lists it; only then may the WAL that
-  // also holds its data be discarded.
-  commit(std::move(next));
-  reset_wal();
-  memtable_.clear();
-  memtable_size_ = 0;
-  maybe_compact();
+  switch_memtable();
+  done_cv_.wait(lock, flushed);
+  rethrow_background_error();
 }
 
+// Merges every table into the deepest level, on the background thread.
 void LSMTree::compact() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  rethrow_background_error();
+  require_writable();
+  manual_compaction_ = true;
+  work_cv_.notify_one();
+  done_cv_.wait(lock, [&] {
+    return !manual_compaction_ || background_error_ != nullptr;
+  });
+  rethrow_background_error();
+}
+
+void LSMTree::wait_for_compactions() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  done_cv_.wait(lock, [&] {
+    return background_error_ != nullptr ||
+           (!busy_ && immutable_ == nullptr && !manual_compaction_ &&
+            !needs_compaction(*published_));
+  });
+  rethrow_background_error();
+}
+
+// The only thread that flushes, compacts or commits to the MANIFEST, so
+// levels_ and the MANIFEST state are touched by it alone once open.
+void LSMTree::background_loop() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  for (;;) {
+    work_cv_.wait(lock, [&] {
+      return stopping_ ||
+             (background_error_ == nullptr &&
+              (immutable_ != nullptr || manual_compaction_ ||
+               needs_compaction(*published_)));
+    });
+    if (stopping_) {
+      return;
+    }
+    busy_ = true;
+    const bool flush_pending = immutable_ != nullptr;
+    const bool manual = manual_compaction_;
+    lock.unlock();
+    try {
+      if (flush_pending) {
+        flush_immutable();
+      } else if (manual) {
+        compact_everything();
+      } else {
+        compaction_step();
+      }
+      lock.lock();
+      if (!flush_pending && manual) {
+        manual_compaction_ = false;
+      }
+    } catch (...) {
+      lock.lock();
+      // Recorded once and rethrown to every waiter; writes are refused
+      // until the database is reopened.
+      background_error_ = std::current_exception();
+      failed_ = true;
+    }
+    busy_ = false;
+    done_cv_.notify_all();
+  }
+}
+
+// Writes the frozen memtable as a level 0 table, commits it, and deletes
+// the WAL files that held its data.
+void LSMTree::flush_immutable() {
+  std::shared_ptr<const Memtable> memtable;
+  std::vector<std::uint64_t> wals;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    memtable = immutable_;
+    wals = immutable_wals_;
+  }
+  const std::uint64_t oldest_reader = smallest_snapshot();
+  if (memtable->empty()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    immutable_.reset();
+    immutable_wals_.clear();
+  } else {
+    const std::uint64_t generation = next_generation_++;
+    const auto temporary = table_path(generation, true);
+    const auto destination = table_path(generation, false);
+    build_table(temporary, options_, memtable->size(), [&](TableWriter& writer) {
+      const std::string* current = nullptr;
+      std::uint64_t newer = 0;
+      for (const auto& [internal, entry] : *memtable) {
+        if (current == nullptr || internal.first != *current) {
+          current = &internal.first;
+          newer = std::numeric_limits<std::uint64_t>::max();
+        }
+        // A version whose newer version is visible to every reader is
+        // hidden from all of them.
+        const bool hidden = newer <= oldest_reader;
+        newer = internal.second;
+        if (!hidden) {
+          writer.add(internal.first, entry);
+        }
+      }
+    });
+    if (::rename(temporary.c_str(), destination.c_str()) != 0) {
+      system_error("rename SSTable");
+    }
+    sync_directory();
+    auto table = load_table(destination);
+    table->smallest = memtable->begin()->first.first;
+    Levels next = levels_;
+    next[0].insert(next[0].begin(), std::move(table));
+    // The table is live once the MANIFEST lists it; the commit also retires
+    // the frozen memtable, so readers never see both or neither.
+    commit(std::move(next), true);
+  }
+  // Only now may the logs holding the same data go.
+  for (const std::uint64_t number : wals) {
+    std::error_code ignored;
+    std::filesystem::remove(wal_path(number), ignored);
+  }
+  sync_directory();
+}
+
+void LSMTree::compact_everything() {
   std::vector<std::shared_ptr<Table>> inputs;
   std::size_t target = 1;
   for (std::size_t level = 0; level < levels_.size(); ++level) {
@@ -2030,9 +2298,8 @@ void LSMTree::compact() {
   if (inputs.size() < 2) {
     return;
   }
-  require_writable();
   // Everything is an input and nothing lies below the target, so every
-  // tombstone can be dropped.
+  // tombstone no snapshot needs can be dropped.
   run_compaction(inputs, target);
 }
 
@@ -2048,26 +2315,36 @@ std::uint64_t LSMTree::level_limit(std::size_t level) const {
   return limit;
 }
 
-void LSMTree::maybe_compact() {
-  for (;;) {
-    if (levels_[0].size() >= options_.compaction_trigger) {
-      compact_level0();
-      continue;
+bool LSMTree::needs_compaction(const Levels& levels) const {
+  if (levels[0].size() >= options_.compaction_trigger) {
+    return true;
+  }
+  // The last level has no size limit.
+  for (std::size_t level = 1; level + 1 < levels.size(); ++level) {
+    std::uint64_t bytes = 0;
+    for (const auto& table : levels[level]) {
+      bytes += table->file_bytes;
     }
-    bool compacted = false;
-    // The last level has no size limit.
-    for (std::size_t level = 1; level + 1 < levels_.size(); ++level) {
-      std::uint64_t bytes = 0;
-      for (const auto& table : levels_[level]) {
-        bytes += table->file_bytes;
-      }
-      if (bytes > level_limit(level)) {
-        compact_level(level);
-        compacted = true;
-        break;
-      }
+    if (bytes > level_limit(level)) {
+      return true;
     }
-    if (!compacted) {
+  }
+  return false;
+}
+
+// One unit of compaction work, chosen from the current levels.
+void LSMTree::compaction_step() {
+  if (levels_[0].size() >= options_.compaction_trigger) {
+    compact_level0();
+    return;
+  }
+  for (std::size_t level = 1; level + 1 < levels_.size(); ++level) {
+    std::uint64_t bytes = 0;
+    for (const auto& table : levels_[level]) {
+      bytes += table->file_bytes;
+    }
+    if (bytes > level_limit(level)) {
+      compact_level(level);
       return;
     }
   }
@@ -2138,7 +2415,6 @@ void LSMTree::compact_level(std::size_t level) {
                              }),
             table);
   commit(std::move(next));
-  table->level = level + 1;
 }
 
 // True when no level below `level` can hold a version of `key`, so a
@@ -2328,14 +2604,6 @@ void LSMTree::run_compaction(const std::vector<std::shared_ptr<Table>>& inputs,
   sync_directory();
 }
 
-void LSMTree::reset_wal() {
-  if (::ftruncate(wal_fd_, 0) != 0 || ::fsync(wal_fd_) != 0) {
-    failed_ = true;
-    system_error("reset WAL");
-  }
-  wal_size_ = 0;
-}
-
 void LSMTree::require_writable() const {
   if (failed_) {
     throw std::runtime_error(
@@ -2360,17 +2628,21 @@ void LSMTree::sync_directory() const {
 
 Stats LSMTree::stats() const {
   Stats stats;
-  stats.memtable_entries = memtable_.size();
-  stats.sequence = sequence_;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats.memtable_entries =
+        memtable_.size() + (immutable_ != nullptr ? immutable_->size() : 0);
+    stats.sequence = sequence_;
+    for (const auto& tables : *published_) {
+      stats.tables_per_level.push_back(tables.size());
+      stats.sstable_count += tables.size();
+    }
+  }
   stats.bloom_checks = bloom_checks_;
   stats.bloom_negative_hits = bloom_negative_hits_;
   stats.block_reads = block_reads_;
   stats.block_cache_hits = block_cache_->hits;
   stats.compaction_bytes_written = compaction_bytes_written_;
-  for (const auto& tables : levels_) {
-    stats.tables_per_level.push_back(tables.size());
-    stats.sstable_count += tables.size();
-  }
   return stats;
 }
 

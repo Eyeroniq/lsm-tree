@@ -7,6 +7,8 @@ ifeq ($(shell uname -s),Darwin)
 MACOS_SDK := $(shell xcrun --show-sdk-path)
 CPPFLAGS += -isysroot $(MACOS_SDK) -isystem $(MACOS_SDK)/usr/include/c++/v1
 LDFLAGS += -isysroot $(MACOS_SDK)
+else
+LDFLAGS += -pthread
 endif
 
 BUILD_DIR := build
@@ -22,7 +24,7 @@ endif
 PIC_DIR := $(BUILD_DIR)/pic
 SHARED_LIB := $(BUILD_DIR)/liblsm.$(SHARED_EXT)
 
-.PHONY: all shared test crash-test powercut-test benchmark java-test server smoke-test clean
+.PHONY: all shared test asan-test tsan-test crash-test powercut-test benchmark java-test server smoke-test clean
 
 all: $(TOOL)
 
@@ -76,6 +78,21 @@ powercut-test: $(TOOL) $(POWERCUT_LIB) $(POWERCUT_SNAPSHOT)
 	python3 scripts/powercut_torture.py --binary ./$(TOOL) \
 		--preload ./$(POWERCUT_LIB) --snapshot ./$(POWERCUT_SNAPSHOT) \
 		--rounds $${POWERCUT_ROUNDS:-100}
+
+SANITIZE_FLAGS := -std=c++17 -O1 -g -fno-omit-frame-pointer \
+	-Wall -Wextra -Wpedantic -Werror
+
+# Memory errors and undefined behaviour (AddressSanitizer + UBSan).
+asan-test:
+	$(MAKE) test BUILD_DIR=build-asan \
+		CXXFLAGS="$(SANITIZE_FLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all" \
+		LDFLAGS="-pthread -fsanitize=address,undefined"
+
+# Data races (ThreadSanitizer).
+tsan-test:
+	$(MAKE) test BUILD_DIR=build-tsan \
+		CXXFLAGS="$(SANITIZE_FLAGS) -fsanitize=thread" \
+		LDFLAGS="-pthread -fsanitize=thread"
 
 java-test: $(SHARED_LIB)
 	cd server && mvn -B -q verify

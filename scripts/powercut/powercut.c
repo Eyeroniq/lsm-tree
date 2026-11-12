@@ -174,11 +174,25 @@ int fsync(int fd) {
     }
   }
   /* POWERCUT_AFTER_FSYNCS=N cuts power the instant the Nth durable step
-   * completes, so every step is hit directly instead of by timing luck. */
+   * completes, so every step is hit directly instead of by timing luck.
+   * POWERCUT_KIND narrows the count to one kind of step -- "dir", "wal",
+   * "table" or "manifest" -- so rare but critical steps such as a
+   * compaction's MANIFEST commit are reached often. */
   static long completed = 0;
   const char* after = getenv("POWERCUT_AFTER_FSYNCS");
-  if (recorded && after != NULL && ++completed == atol(after)) {
-    kill(getpid(), SIGKILL);
+  if (recorded && after != NULL) {
+    const char* wanted = getenv("POWERCUT_KIND");
+    const char* name = strrchr(path, '/');
+    name = name == NULL ? path : name + 1;
+    const char* kind = S_ISDIR(info.st_mode)                 ? "dir"
+                       : strncmp(name, "MANIFEST", 8) == 0   ? "manifest"
+                       : strncmp(name, "sst-", 4) == 0       ? "table"
+                                                             : "wal";
+    if ((wanted == NULL || strcmp(wanted, "any") == 0 ||
+         strcmp(wanted, kind) == 0) &&
+        ++completed == atol(after)) {
+      kill(getpid(), SIGKILL);
+    }
   }
   errno = saved;
   return result;

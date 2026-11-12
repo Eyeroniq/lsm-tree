@@ -1,5 +1,6 @@
 #include "lsm/lsm.h"
 
+#include <atomic>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
@@ -9,7 +10,9 @@
 #include <random>
 #include <string>
 #include <sys/resource.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -35,6 +38,23 @@ std::filesystem::path test_directory(const std::string& name) {
 void reset(const std::filesystem::path& directory) {
   std::error_code error;
   std::filesystem::remove_all(directory, error);
+}
+
+// The WAL file new writes go to: the highest-numbered wal-N.log.
+std::filesystem::path newest_wal(const std::filesystem::path& directory) {
+  std::filesystem::path newest;
+  unsigned long long highest = 0;
+  for (const auto& item : std::filesystem::directory_iterator(directory)) {
+    const std::string name = item.path().filename().string();
+    if (name.rfind("wal-", 0) == 0 && item.path().extension() == ".log") {
+      const unsigned long long number = std::stoull(name.substr(4));
+      if (newest.empty() || number > highest) {
+        highest = number;
+        newest = item.path();
+      }
+    }
+  }
+  return newest;
 }
 
 lsm::Options small_options() {
@@ -147,7 +167,7 @@ void test_torn_wal_tail_is_repaired() {
     lsm::LSMTree database(directory);
     database.put("complete", "record");
   }
-  const auto wal = directory / "active.wal";
+  const auto wal = newest_wal(directory);
   {
     std::ofstream output(wal, std::ios::binary | std::ios::app);
     output.write("WAL1broken-tail", 15);
@@ -293,9 +313,9 @@ void test_corrupt_sstable_is_rejected() {
 void test_failed_wal_write_does_not_lose_later_writes() {
   const auto directory = test_directory("failed-write");
   reset(directory);
-  const auto wal = directory / "active.wal";
   {
     lsm::LSMTree database(directory);
+    const auto wal = newest_wal(directory);
     database.put("before", "kept");
     const auto clean_size = std::filesystem::file_size(wal);
 
@@ -637,6 +657,7 @@ void test_data_moves_through_levels() {
         oracle[key] = value;
       }
     }
+    database.wait_for_compactions();
     const auto stats = database.stats();
     CHECK(deepest_level(stats) >= 3);
     CHECK(stats.tables_per_level[0] < options.compaction_trigger);
@@ -1202,6 +1223,7 @@ void test_snapshot_survives_leveled_compaction() {
       now[key] = value;
     }
   }
+  database.wait_for_compactions();
   CHECK(deepest_level(database.stats()) >= 2);
   std::vector<std::pair<std::string, std::string>> expected_then;
   for (const auto& [key, value] : then) {
@@ -1242,6 +1264,110 @@ void test_tombstone_kept_while_snapshot_needs_old_value() {
   reset(directory);
 }
 
+void test_concurrent_readers_writers_and_snapshots() {
+  const auto directory = test_directory("concurrent");
+  reset(directory);
+  auto options = small_options();
+  options.memtable_bytes = 2048;
+  options.compaction_trigger = 3;
+  options.table_bytes = 4096;
+  options.level1_bytes = 8192;
+  options.sync_writes = false;
+  constexpr int kWriters = 2;
+  constexpr int kReaders = 4;
+  constexpr int kKeys = 2500;
+  std::atomic<int> progress[kWriters];
+  for (auto& written : progress) {
+    written = 0;
+  }
+  std::atomic<bool> writing{true};
+  std::atomic<int> problems{0};
+  std::atomic<long> reads{0};
+  std::atomic<long> snapshot_checks{0};
+  {
+    lsm::LSMTree database(directory, options);
+    std::vector<std::thread> threads;
+    for (int writer = 0; writer < kWriters; ++writer) {
+      threads.emplace_back([&, writer] {
+        const std::string prefix = "w" + std::to_string(writer) + "-";
+        for (int index = 0; index < kKeys; ++index) {
+          database.put(numbered(prefix, index), std::to_string(index));
+          // Published only after put() returned.
+          progress[writer].store(index + 1, std::memory_order_release);
+        }
+      });
+    }
+    for (int reader = 0; reader < kReaders; ++reader) {
+      threads.emplace_back([&, reader] {
+        std::mt19937 random(static_cast<unsigned>(reader) + 1);
+        while (writing.load()) {
+          const int writer = static_cast<int>(random() % kWriters);
+          const std::string prefix = "w" + std::to_string(writer) + "-";
+          const int done = progress[writer].load(std::memory_order_acquire);
+          if (done > 0) {
+            // Every acknowledged write is visible, with its value.
+            const int index = static_cast<int>(random() % done);
+            if (database.get(numbered(prefix, index)) !=
+                std::optional<std::string>(std::to_string(index))) {
+              ++problems;
+            }
+            ++reads;
+          }
+          if (random() % 16 == 0) {
+            // Keys are written in order, so a consistent snapshot holds
+            // exactly keys 0..m-1 of each writer: no gaps, nothing after.
+            const auto snapshot = database.snapshot();
+            const int floor = done;
+            const auto page = database.scan(prefix, prefix + "~", *snapshot);
+            const int seen = static_cast<int>(page.size());
+            if (seen < floor) {
+              ++problems;
+            }
+            for (int index = 0; index < seen; ++index) {
+              if (page[static_cast<std::size_t>(index)].first !=
+                      numbered(prefix, index) ||
+                  page[static_cast<std::size_t>(index)].second !=
+                      std::to_string(index)) {
+                ++problems;
+                break;
+              }
+            }
+            if (database.get(numbered(prefix, seen), *snapshot)) {
+              ++problems;
+            }
+            ++snapshot_checks;
+          }
+        }
+      });
+    }
+    threads.emplace_back([&] {
+      for (int round = 0; round < 6 && writing.load(); ++round) {
+        database.flush();
+        database.compact();
+      }
+    });
+    for (int writer = 0; writer < kWriters; ++writer) {
+      threads[static_cast<std::size_t>(writer)].join();
+    }
+    writing = false;
+    for (std::size_t index = kWriters; index < threads.size(); ++index) {
+      threads[index].join();
+    }
+    database.wait_for_compactions();
+    CHECK(problems.load() == 0);
+    CHECK(reads.load() > 1000);
+    CHECK(snapshot_checks.load() > 50);
+    CHECK(database.stats().compaction_bytes_written > 0);
+  }
+  lsm::LSMTree database(directory, options);
+  for (int writer = 0; writer < kWriters; ++writer) {
+    const std::string prefix = "w" + std::to_string(writer) + "-";
+    CHECK(database.scan(prefix, prefix + "~").size() ==
+          static_cast<std::size_t>(kKeys));
+  }
+  reset(directory);
+}
+
 }  // namespace
 
 int main() {
@@ -1278,6 +1404,7 @@ int main() {
   test_released_snapshot_lets_versions_go();
   test_snapshot_survives_leveled_compaction();
   test_tombstone_kept_while_snapshot_needs_old_value();
+  test_concurrent_readers_writers_and_snapshots();
   if (failures != 0) {
     std::cerr << failures << " of " << assertions << " assertions failed\n";
     return 1;

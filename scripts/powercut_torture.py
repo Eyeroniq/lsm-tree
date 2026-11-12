@@ -94,7 +94,15 @@ def main() -> int:
             mode = 0.0 if fresh else randomizer.random()
             round_environment = dict(environment)
             if mode < 1 / 3:
-                limit = 30 if fresh else 250
+                # Count every fsync, or only one kind of step; metadata
+                # steps are few per round, so their counts stay small.
+                kind, limit = (
+                    ("any", 30) if fresh else randomizer.choice(
+                        [("any", 250), ("manifest", 12), ("dir", 12),
+                         ("table", 8)]
+                    )
+                )
+                round_environment["POWERCUT_KIND"] = kind
                 round_environment["POWERCUT_AFTER_FSYNCS"] = str(
                     randomizer.randint(1, limit)
                 )

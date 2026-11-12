@@ -1,10 +1,15 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <optional>
 #include <string>
 #include <vector>
@@ -71,6 +76,9 @@ class Snapshot {
   std::shared_ptr<Registry> registry_;
 };
 
+// Every public member is safe to call from any number of threads at once.
+// Reads run in parallel with each other and with writes; writes are applied
+// one at a time. Flushes and compactions run on a background thread.
 class LSMTree {
  public:
   struct Entry;
@@ -97,8 +105,12 @@ class LSMTree {
       const std::string& begin, const std::string& end,
       const Snapshot& snapshot) const;
 
+  // Writes the memtable to a table and waits until it is committed.
   void flush();
+  // Merges every table into the deepest level and waits for it.
   void compact();
+  // Waits until no flush or compaction is pending or running.
+  void wait_for_compactions();
   Stats stats() const;
 
  private:
@@ -115,8 +127,14 @@ class LSMTree {
     }
   };
 
+  using Memtable = std::map<std::pair<std::string, std::uint64_t>, Entry,
+                           VersionOrder>;
+
   void mutate(const std::string& key, const std::string& value,
               bool tombstone);
+  void make_room();
+  void switch_memtable();
+  void rethrow_background_error() const;
   void insert_memtable(const std::string& key, Entry entry);
   std::optional<std::string> read(const std::string& key,
                                   std::uint64_t at) const;
@@ -126,24 +144,29 @@ class LSMTree {
   std::uint64_t smallest_snapshot() const;
   void acquire_lock();
   void open_tables();
-  void commit(Levels next);
+  void commit(Levels next, bool flushed_memtable = false);
   void rewrite_manifest();
-  void recover_wal();
+  std::filesystem::path wal_path(std::uint64_t number) const;
+  void open_wals();
+  void rotate_wal();
+  void recover_wal(const std::filesystem::path& path);
+  void background_loop();
+  void flush_immutable();
+  void compact_everything();
+  void compaction_step();
+  bool needs_compaction(const Levels& levels) const;
   std::filesystem::path table_path(std::uint64_t generation,
                                    bool temporary) const;
-  void maybe_compact();
   void compact_level0();
   void compact_level(std::size_t level);
   void run_compaction(const std::vector<std::shared_ptr<Table>>& inputs,
                       std::size_t output_level);
   bool is_base_level(std::size_t level, const std::string& key) const;
   std::uint64_t level_limit(std::size_t level) const;
-  void reset_wal();
   void sync_directory() const;
   void require_writable() const;
 
   std::filesystem::path directory_;
-  std::filesystem::path wal_path_;
   Options options_;
   int wal_fd_ = -1;
   // Holds an exclusive flock on <directory>/LOCK for the object's lifetime.
@@ -157,21 +180,40 @@ class LSMTree {
   std::uint64_t wal_size_ = 0;
   // Set when an I/O error leaves the on-disk state uncertain; all further
   // mutations are refused until the database is reopened.
-  bool failed_ = false;
+  std::atomic<bool> failed_{false};
   std::uint64_t sequence_ = 0;
   std::uint64_t next_generation_ = 1;
   std::size_t memtable_size_ = 0;
-  std::map<std::pair<std::string, std::uint64_t>, Entry, VersionOrder>
-      memtable_;
+  Memtable memtable_;
   std::shared_ptr<Snapshot::Registry> snapshots_;
   Levels levels_;
   // Per level, the largest key of the last table compacted from it, so that
   // successive compactions walk the key space round-robin.
   std::vector<std::string> compact_pointer_;
-  std::uint64_t compaction_bytes_written_ = 0;
-  mutable std::uint64_t bloom_checks_ = 0;
-  mutable std::uint64_t bloom_negative_hits_ = 0;
-  mutable std::uint64_t block_reads_ = 0;
+  std::atomic<std::uint64_t> compaction_bytes_written_{0};
+
+  // Concurrency. mutex_ guards memtable_, memtable_size_, immutable_,
+  // immutable_wals_, published_, sequence_ and the background-work flags.
+  // write_mutex_ orders writers and guards the WAL. levels_ and the MANIFEST
+  // state belong to the background thread once the database is open;
+  // readers use the published_ copy.
+  mutable std::mutex mutex_;
+  std::mutex write_mutex_;
+  std::condition_variable work_cv_;
+  std::condition_variable done_cv_;
+  std::shared_ptr<const Memtable> immutable_;
+  std::vector<std::uint64_t> immutable_wals_;
+  std::vector<std::uint64_t> memtable_wals_;
+  std::uint64_t wal_number_ = 0;
+  std::shared_ptr<const Levels> published_;
+  bool stopping_ = false;
+  bool busy_ = false;
+  bool manual_compaction_ = false;
+  std::exception_ptr background_error_;
+  std::thread worker_;
+  mutable std::atomic<std::uint64_t> bloom_checks_{0};
+  mutable std::atomic<std::uint64_t> bloom_negative_hits_{0};
+  mutable std::atomic<std::uint64_t> block_reads_{0};
   mutable std::unique_ptr<BlockCache> block_cache_;
 };
 
