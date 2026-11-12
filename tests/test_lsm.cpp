@@ -1,5 +1,6 @@
 #include "lsm/lsm.h"
 
+#include <atomic>
 #include <csignal>
 #include <filesystem>
 #include <fstream>
@@ -9,7 +10,9 @@
 #include <random>
 #include <string>
 #include <sys/resource.h>
+#include <thread>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -35,6 +38,23 @@ std::filesystem::path test_directory(const std::string& name) {
 void reset(const std::filesystem::path& directory) {
   std::error_code error;
   std::filesystem::remove_all(directory, error);
+}
+
+// The WAL file new writes go to: the highest-numbered wal-N.log.
+std::filesystem::path newest_wal(const std::filesystem::path& directory) {
+  std::filesystem::path newest;
+  unsigned long long highest = 0;
+  for (const auto& item : std::filesystem::directory_iterator(directory)) {
+    const std::string name = item.path().filename().string();
+    if (name.rfind("wal-", 0) == 0 && item.path().extension() == ".log") {
+      const unsigned long long number = std::stoull(name.substr(4));
+      if (newest.empty() || number > highest) {
+        highest = number;
+        newest = item.path();
+      }
+    }
+  }
+  return newest;
 }
 
 lsm::Options small_options() {
@@ -147,7 +167,7 @@ void test_torn_wal_tail_is_repaired() {
     lsm::LSMTree database(directory);
     database.put("complete", "record");
   }
-  const auto wal = directory / "active.wal";
+  const auto wal = newest_wal(directory);
   {
     std::ofstream output(wal, std::ios::binary | std::ios::app);
     output.write("WAL1broken-tail", 15);
@@ -293,9 +313,9 @@ void test_corrupt_sstable_is_rejected() {
 void test_failed_wal_write_does_not_lose_later_writes() {
   const auto directory = test_directory("failed-write");
   reset(directory);
-  const auto wal = directory / "active.wal";
   {
     lsm::LSMTree database(directory);
+    const auto wal = newest_wal(directory);
     database.put("before", "kept");
     const auto clean_size = std::filesystem::file_size(wal);
 
@@ -459,7 +479,7 @@ void test_version1_table_is_read_and_migrated() {
     database.compact();
     const auto files = table_files(directory);
     CHECK(files.size() == 1);
-    CHECK(!files.empty() && table_version(files.front()) == 2);
+    CHECK(!files.empty() && table_version(files.front()) == 3);
   }
   {
     lsm::LSMTree database(directory);
@@ -637,6 +657,7 @@ void test_data_moves_through_levels() {
         oracle[key] = value;
       }
     }
+    database.wait_for_compactions();
     const auto stats = database.stats();
     CHECK(deepest_level(stats) >= 3);
     CHECK(stats.tables_per_level[0] < options.compaction_trigger);
@@ -759,6 +780,594 @@ void test_damaged_manifest_is_rejected() {
   reset(directory);
 }
 
+std::string read_file(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(input)),
+                     std::istreambuf_iterator<char>());
+}
+
+void write_file(const std::filesystem::path& path, const std::string& bytes) {
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+std::uint32_t get_u32(const std::string& bytes, std::size_t offset) {
+  std::uint32_t value = 0;
+  for (int index = 3; index >= 0; --index) {
+    value = (value << 8) | static_cast<unsigned char>(bytes[offset + index]);
+  }
+  return value;
+}
+
+// Offsets of each record in a version 2 MANIFEST.
+std::vector<std::size_t> manifest_records(const std::string& bytes) {
+  std::vector<std::size_t> offsets;
+  std::size_t position = 8;
+  while (position + 9 <= bytes.size()) {
+    offsets.push_back(position);
+    position += 5 + get_u32(bytes, position) + 4;
+  }
+  return offsets;
+}
+
+void test_manifest_appends_edits() {
+  const auto directory = test_directory("manifest-log");
+  reset(directory);
+  lsm::Options options;
+  options.compaction_trigger = 10;
+  const auto manifest = directory / "MANIFEST";
+  {
+    lsm::LSMTree database(directory, options);
+    std::uintmax_t previous = std::filesystem::file_size(manifest);
+    for (int round = 0; round < 5; ++round) {
+      database.put(numbered("key-", round), "value");
+      database.flush();
+      const auto size = std::filesystem::file_size(manifest);
+      // One small edit is appended per flush; nothing is rewritten.
+      CHECK(size > previous);
+      CHECK(size - previous < 100);
+      previous = size;
+    }
+  }
+  const std::string bytes = read_file(manifest);
+  CHECK(get_u32(bytes, 0) == 0x324E414DU);  // MAN2
+  CHECK(manifest_records(bytes).size() == 6);  // snapshot + five edits
+  lsm::LSMTree database(directory, options);
+  CHECK(database.stats().sstable_count == 5);
+  CHECK(database.get("key-0004") == std::optional<std::string>("value"));
+  reset(directory);
+}
+
+void test_manifest_log_stays_bounded() {
+  const auto directory = test_directory("manifest-bounded");
+  reset(directory);
+  auto options = small_options();
+  options.sync_writes = false;
+  std::uintmax_t largest = 0;
+  {
+    lsm::LSMTree database(directory, options);
+    for (int index = 0; index < 6000; ++index) {
+      database.put(numbered("bounded-", index % 900), std::to_string(index));
+      largest = std::max(largest, std::filesystem::file_size(directory / "MANIFEST"));
+    }
+  }
+  // Thousands of edits, but the log is rewritten as a snapshot once it is
+  // well past 64 KiB.
+  CHECK(largest < 256 * 1024);
+  lsm::LSMTree database(directory, options);
+  for (int index = 5100; index < 6000; ++index) {
+    CHECK(database.get(numbered("bounded-", index % 900)) ==
+          std::optional<std::string>(std::to_string(index)));
+  }
+  reset(directory);
+}
+
+void test_torn_manifest_tail_is_ignored() {
+  const auto directory = test_directory("manifest-torn");
+  reset(directory);
+  lsm::Options options;
+  options.compaction_trigger = 10;
+  {
+    lsm::LSMTree database(directory, options);
+    database.put("a", "1");
+    database.flush();
+    database.put("b", "2");
+    database.flush();
+  }
+  const auto manifest = directory / "MANIFEST";
+  const std::string clean = read_file(manifest);
+  for (int variant = 0; variant < 2; ++variant) {
+    std::string damaged = clean;
+    if (variant == 0) {
+      // An append cut short: the header promises more bytes than exist.
+      put_u32(damaged, 200);
+      damaged += "\x02partial";
+    } else {
+      // A complete final record whose checksum does not match.
+      std::string payload(30, 'x');
+      put_u32(damaged, static_cast<std::uint32_t>(payload.size()));
+      damaged += '\x02';
+      damaged += payload;
+      put_u32(damaged, 0xDEADBEEFU);
+    }
+    write_file(manifest, damaged);
+    {
+      lsm::LSMTree database(directory, options);
+      CHECK(database.get("a") == std::optional<std::string>("1"));
+      CHECK(database.get("b") == std::optional<std::string>("2"));
+      CHECK(database.stats().sstable_count == 2);
+    }
+    // The uncommitted edit is gone; the log was rewritten cleanly.
+    CHECK(read_file(manifest).size() < damaged.size());
+  }
+  reset(directory);
+}
+
+void test_corrupt_manifest_record_before_tail_fails_open() {
+  const auto directory = test_directory("manifest-middle");
+  reset(directory);
+  lsm::Options options;
+  options.compaction_trigger = 10;
+  {
+    lsm::LSMTree database(directory, options);
+    for (int round = 0; round < 3; ++round) {
+      database.put(numbered("key-", round), "value");
+      database.flush();
+    }
+  }
+  const auto manifest = directory / "MANIFEST";
+  std::string bytes = read_file(manifest);
+  const auto records = manifest_records(bytes);
+  CHECK(records.size() == 4);
+  // Damage the first edit; two valid edits follow it. Treating this as a
+  // torn tail would drop the later tables and delete them as orphans.
+  bytes[records[1] + 9] ^= 0x5A;
+  write_file(manifest, bytes);
+  bool rejected = false;
+  try {
+    lsm::LSMTree database(directory, options);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  CHECK(rejected);
+  CHECK(table_files(directory).size() == 3);  // Nothing was deleted.
+  reset(directory);
+}
+
+void test_version1_manifest_is_upgraded() {
+  const auto directory = test_directory("manifest-v1");
+  reset(directory);
+  {
+    lsm::LSMTree database(directory);
+    database.put("k", "v");
+    database.flush();
+  }
+  // The single-snapshot format written by the previous release.
+  std::string bytes;
+  put_u32(bytes, 0x314E414DU);  // MAN1
+  put_u32(bytes, 1);
+  put_u64(bytes, 2);  // next generation
+  put_u32(bytes, 1);  // one table
+  put_u64(bytes, 1);  // generation
+  put_u32(bytes, 0);  // level
+  put_u32(bytes, 1);
+  bytes += "k";
+  put_u32(bytes, 1);
+  bytes += "k";
+  put_u32(bytes, lsm::crc32(reinterpret_cast<const std::uint8_t*>(bytes.data()),
+                            bytes.size()));
+  write_file(directory / "MANIFEST", bytes);
+  {
+    lsm::LSMTree database(directory);
+    CHECK(database.get("k") == std::optional<std::string>("v"));
+  }
+  CHECK(get_u32(read_file(directory / "MANIFEST"), 0) == 0x324E414DU);
+  reset(directory);
+}
+
+// Hand-builds a one-block table in the version 2 format written by earlier
+// releases: [header | block (fixed entries + CRC) | index + CRC | Bloom |
+// 64-byte footer].
+void write_v2_table(const std::filesystem::path& path) {
+  struct Row {
+    std::uint64_t sequence;
+    bool tombstone;
+    std::string key;
+    std::string value;
+  };
+  const std::vector<Row> rows = {{1, false, "alpha", "one"},
+                                 {2, true, "beta", ""},
+                                 {3, false, "gamma", "three"}};
+  const auto crc = [](const std::string& bytes) {
+    return lsm::crc32(reinterpret_cast<const std::uint8_t*>(bytes.data()),
+                      bytes.size());
+  };
+  std::string block;
+  for (const auto& row : rows) {
+    put_u64(block, row.sequence);
+    block.push_back(row.tombstone ? 1 : 0);
+    block.append(3, '\0');
+    put_u32(block, static_cast<std::uint32_t>(row.key.size()));
+    put_u32(block, static_cast<std::uint32_t>(row.value.size()));
+    block += row.key;
+    block += row.value;
+  }
+  put_u32(block, crc(block));
+  std::string index;
+  put_u32(index, 5);
+  index += "gamma";
+  put_u64(index, 8);
+  put_u32(index, static_cast<std::uint32_t>(block.size()));
+  put_u32(index, crc(index));
+  const std::string bloom(8, static_cast<char>(0xFF));  // "maybe" for all
+  std::string bytes;
+  put_u32(bytes, 0x31545353U);  // SST1
+  put_u32(bytes, 2);            // version 2
+  bytes += block;
+  const std::uint64_t index_offset = bytes.size();
+  bytes += index;
+  const std::uint64_t bloom_offset = bytes.size();
+  bytes += bloom;
+  std::string footer;
+  put_u64(footer, index_offset);
+  put_u64(footer, index.size());
+  put_u64(footer, bloom_offset);
+  put_u64(footer, bloom.size());
+  put_u64(footer, rows.size());
+  put_u64(footer, 3);   // max sequence
+  put_u32(footer, 64);  // Bloom bits
+  put_u32(footer, 1);   // Bloom hashes
+  put_u32(footer, 0x46545353U);
+  put_u32(footer, crc(footer));
+  bytes += footer;
+  write_file(path, bytes);
+}
+
+void test_version2_table_is_read_and_migrated() {
+  const auto directory = test_directory("v2-table");
+  reset(directory);
+  std::filesystem::create_directories(directory);
+  write_v2_table(directory / "sst-1.dat");
+  {
+    lsm::LSMTree database(directory);
+    CHECK(database.get("alpha") == std::optional<std::string>("one"));
+    CHECK(!database.get("beta"));
+    CHECK(database.get("gamma") == std::optional<std::string>("three"));
+    const std::vector<std::pair<std::string, std::string>> expected = {
+        {"alpha", "one"}, {"gamma", "three"}};
+    CHECK(database.scan("", "") == expected);
+    CHECK(database.stats().sequence == 3);
+    database.put("delta", "four");
+    database.flush();
+    database.compact();
+    const auto files = table_files(directory);
+    CHECK(files.size() == 1);
+    CHECK(!files.empty() && table_version(files.front()) == 3);
+  }
+  lsm::LSMTree database(directory);
+  CHECK(database.get("alpha") == std::optional<std::string>("one"));
+  CHECK(database.get("delta") == std::optional<std::string>("four"));
+  CHECK(!database.get("beta"));
+  reset(directory);
+}
+
+void test_prefix_compression_shrinks_tables() {
+  const auto directory = test_directory("prefix");
+  reset(directory);
+  lsm::Options options;
+  options.memtable_bytes = 1 << 20;
+  std::size_t raw_bytes = 0;
+  {
+    lsm::LSMTree database(directory, options);
+    for (int index = 0; index < 2000; ++index) {
+      const std::string key = "customer:profile:" + numbered("", index);
+      const std::string value = "v" + std::to_string(index);
+      database.put(key, value);
+      raw_bytes += key.size() + value.size();
+    }
+    database.flush();
+  }
+  const auto files = table_files(directory);
+  CHECK(files.size() == 1);
+  // The previous format spent 20 bytes per entry on headers and stored every
+  // key whole, so its tables were larger than the raw data. Shared prefixes
+  // and varint lengths bring this one well below it.
+  CHECK(!files.empty() && std::filesystem::file_size(files.front()) <
+                              raw_bytes * 7 / 10);
+  reset(directory);
+}
+
+void test_restart_points_find_every_key() {
+  const auto directory = test_directory("restarts");
+  reset(directory);
+  lsm::Options options;
+  options.memtable_bytes = 1 << 20;
+  options.block_bytes = 1 << 20;  // One block with many restart points.
+  options.block_cache_bytes = 0;  // Every lookup searches the raw block.
+  {
+    lsm::LSMTree database(directory, options);
+    for (int index = 0; index < 1000; index += 2) {
+      database.put(numbered("key-", index), std::to_string(index));
+    }
+    database.flush();
+  }
+  lsm::LSMTree database(directory, options);
+  for (int index = 0; index < 1000; ++index) {
+    const auto value = database.get(numbered("key-", index));
+    if (index % 2 == 0) {
+      CHECK(value == std::optional<std::string>(std::to_string(index)));
+    } else {
+      CHECK(!value);  // Falls between two stored keys.
+    }
+  }
+  CHECK(!database.get("key-"));       // Before the first key.
+  CHECK(!database.get("key-9999"));   // After the last key.
+  // Ranges that start and end in the middle of restart segments.
+  for (int begin = 1; begin < 1000; begin += 37) {
+    const auto page = database.scan(numbered("key-", begin), numbered("key-", begin + 41));
+    std::size_t expected = 0;
+    for (int index = begin; index < begin + 41 && index < 1000; ++index) {
+      expected += index % 2 == 0 ? 1 : 0;
+    }
+    CHECK(page.size() == expected);
+  }
+  reset(directory);
+}
+
+void test_snapshot_sees_a_frozen_view() {
+  const auto directory = test_directory("snapshot");
+  reset(directory);
+  lsm::Options options;
+  options.compaction_trigger = 10;
+  lsm::LSMTree database(directory, options);
+  database.put("a", "1");
+  database.put("b", "1");
+  const auto snapshot = database.snapshot();
+  database.put("a", "2");
+  database.erase("b");
+  database.put("c", "3");
+  const std::vector<std::pair<std::string, std::string>> then = {{"a", "1"},
+                                                                 {"b", "1"}};
+  std::vector<std::pair<std::string, std::string>> now = {{"a", "2"},
+                                                          {"c", "3"}};
+  // In the memtable, after a flush, and after full compactions, the
+  // snapshot sees the old view and plain reads see the new one.
+  for (int stage = 0; stage < 3; ++stage) {
+    CHECK(database.get("a", *snapshot) == std::optional<std::string>("1"));
+    CHECK(database.get("b", *snapshot) == std::optional<std::string>("1"));
+    CHECK(!database.get("c", *snapshot));
+    CHECK(database.scan("", "", *snapshot) == then);
+    CHECK(database.get("a") == std::optional<std::string>("2"));
+    CHECK(!database.get("b"));
+    CHECK(database.scan("", "") == now);
+    if (stage == 0) {
+      database.flush();
+    } else {
+      database.put("d", std::to_string(stage));
+      if (now.size() == 2) {
+        now.emplace_back("d", "");
+      }
+      now.back().second = std::to_string(stage);
+      database.flush();
+      database.compact();
+    }
+  }
+  reset(directory);
+}
+
+void test_released_snapshot_lets_versions_go() {
+  const auto directory = test_directory("snapshot-gc");
+  reset(directory);
+  lsm::Options options;
+  options.memtable_bytes = 1 << 20;
+  options.compaction_trigger = 10;
+  const std::string big(1000, 'x');
+  lsm::LSMTree database(directory, options);
+  database.put("k", "original");
+  database.put("other", "o");
+  auto snapshot = database.snapshot();
+  for (int version = 0; version < 100; ++version) {
+    database.put("k", big + std::to_string(version));
+  }
+  database.flush();
+  database.put("other", "o2");
+  database.flush();
+  database.compact();
+  // Every version newer than the snapshot is kept while it lives, because
+  // the newest version is not visible to it.
+  std::uintmax_t held = 0;
+  for (const auto& file : table_files(directory)) {
+    held += std::filesystem::file_size(file);
+  }
+  CHECK(held > 50 * big.size());
+  CHECK(database.get("k", *snapshot) == std::optional<std::string>("original"));
+  snapshot.reset();
+  database.put("other", "o3");
+  database.flush();
+  database.compact();
+  std::uintmax_t released = 0;
+  for (const auto& file : table_files(directory)) {
+    released += std::filesystem::file_size(file);
+  }
+  // Once no snapshot can see them, only the newest version remains.
+  CHECK(released < 3 * big.size());
+  CHECK(database.get("k") == std::optional<std::string>(big + "99"));
+  reset(directory);
+}
+
+void test_snapshot_survives_leveled_compaction() {
+  const auto directory = test_directory("snapshot-levels");
+  reset(directory);
+  auto options = small_options();
+  options.sync_writes = false;
+  std::mt19937 random(777);
+  std::map<std::string, std::optional<std::string>> then;
+  std::map<std::string, std::optional<std::string>> now;
+  lsm::LSMTree database(directory, options);
+  for (int step = 0; step < 800; ++step) {
+    const std::string key = numbered("snap-", static_cast<int>(random() % 300));
+    const std::string value = "a" + std::to_string(random() % 1000);
+    database.put(key, value);
+    now[key] = value;
+  }
+  then = now;
+  const auto snapshot = database.snapshot();
+  for (int step = 0; step < 4000; ++step) {
+    const std::string key = numbered("snap-", static_cast<int>(random() % 300));
+    if (random() % 4 == 0) {
+      database.erase(key);
+      now[key] = std::nullopt;
+    } else {
+      const std::string value = "b" + std::to_string(random() % 1000);
+      database.put(key, value);
+      now[key] = value;
+    }
+  }
+  database.wait_for_compactions();
+  CHECK(deepest_level(database.stats()) >= 2);
+  std::vector<std::pair<std::string, std::string>> expected_then;
+  for (const auto& [key, value] : then) {
+    CHECK(database.get(key, *snapshot) == value);
+    if (value) {
+      expected_then.emplace_back(key, *value);
+    }
+  }
+  for (const auto& [key, value] : now) {
+    CHECK(database.get(key) == value);
+  }
+  CHECK(database.scan("", "", *snapshot) == expected_then);
+  reset(directory);
+}
+
+void test_tombstone_kept_while_snapshot_needs_old_value() {
+  const auto directory = test_directory("snapshot-tombstone");
+  reset(directory);
+  lsm::Options options;
+  options.compaction_trigger = 10;
+  lsm::LSMTree database(directory, options);
+  database.put("k", "v");
+  database.flush();
+  {
+    const auto snapshot = database.snapshot();
+    database.erase("k");
+    database.flush();
+    database.compact();
+    CHECK(!database.get("k"));
+    CHECK(database.get("k", *snapshot) == std::optional<std::string>("v"));
+  }
+  // Released: the tombstone and the value it hid can both go.
+  database.put("z", "1");
+  database.flush();
+  database.compact();
+  CHECK(!database.get("k"));
+  CHECK(database.scan("", "").size() == 1);
+  reset(directory);
+}
+
+void test_concurrent_readers_writers_and_snapshots() {
+  const auto directory = test_directory("concurrent");
+  reset(directory);
+  auto options = small_options();
+  options.memtable_bytes = 2048;
+  options.compaction_trigger = 3;
+  options.table_bytes = 4096;
+  options.level1_bytes = 8192;
+  options.sync_writes = false;
+  constexpr int kWriters = 2;
+  constexpr int kReaders = 4;
+  constexpr int kKeys = 2500;
+  std::atomic<int> progress[kWriters];
+  for (auto& written : progress) {
+    written = 0;
+  }
+  std::atomic<bool> writing{true};
+  std::atomic<int> problems{0};
+  std::atomic<long> reads{0};
+  std::atomic<long> snapshot_checks{0};
+  {
+    lsm::LSMTree database(directory, options);
+    std::vector<std::thread> threads;
+    for (int writer = 0; writer < kWriters; ++writer) {
+      threads.emplace_back([&, writer] {
+        const std::string prefix = "w" + std::to_string(writer) + "-";
+        for (int index = 0; index < kKeys; ++index) {
+          database.put(numbered(prefix, index), std::to_string(index));
+          // Published only after put() returned.
+          progress[writer].store(index + 1, std::memory_order_release);
+        }
+      });
+    }
+    for (int reader = 0; reader < kReaders; ++reader) {
+      threads.emplace_back([&, reader] {
+        std::mt19937 random(static_cast<unsigned>(reader) + 1);
+        while (writing.load()) {
+          const int writer = static_cast<int>(random() % kWriters);
+          const std::string prefix = "w" + std::to_string(writer) + "-";
+          const int done = progress[writer].load(std::memory_order_acquire);
+          if (done > 0) {
+            // Every acknowledged write is visible, with its value.
+            const int index = static_cast<int>(random() % done);
+            if (database.get(numbered(prefix, index)) !=
+                std::optional<std::string>(std::to_string(index))) {
+              ++problems;
+            }
+            ++reads;
+          }
+          if (random() % 16 == 0) {
+            // Keys are written in order, so a consistent snapshot holds
+            // exactly keys 0..m-1 of each writer: no gaps, nothing after.
+            const auto snapshot = database.snapshot();
+            const int floor = done;
+            const auto page = database.scan(prefix, prefix + "~", *snapshot);
+            const int seen = static_cast<int>(page.size());
+            if (seen < floor) {
+              ++problems;
+            }
+            for (int index = 0; index < seen; ++index) {
+              if (page[static_cast<std::size_t>(index)].first !=
+                      numbered(prefix, index) ||
+                  page[static_cast<std::size_t>(index)].second !=
+                      std::to_string(index)) {
+                ++problems;
+                break;
+              }
+            }
+            if (database.get(numbered(prefix, seen), *snapshot)) {
+              ++problems;
+            }
+            ++snapshot_checks;
+          }
+        }
+      });
+    }
+    threads.emplace_back([&] {
+      for (int round = 0; round < 6 && writing.load(); ++round) {
+        database.flush();
+        database.compact();
+      }
+    });
+    for (int writer = 0; writer < kWriters; ++writer) {
+      threads[static_cast<std::size_t>(writer)].join();
+    }
+    writing = false;
+    for (std::size_t index = kWriters; index < threads.size(); ++index) {
+      threads[index].join();
+    }
+    database.wait_for_compactions();
+    CHECK(problems.load() == 0);
+    CHECK(reads.load() > 1000);
+    CHECK(snapshot_checks.load() > 50);
+    CHECK(database.stats().compaction_bytes_written > 0);
+  }
+  lsm::LSMTree database(directory, options);
+  for (int writer = 0; writer < kWriters; ++writer) {
+    const std::string prefix = "w" + std::to_string(writer) + "-";
+    CHECK(database.scan(prefix, prefix + "~").size() ==
+          static_cast<std::size_t>(kKeys));
+  }
+  reset(directory);
+}
+
 }  // namespace
 
 int main() {
@@ -783,6 +1392,19 @@ int main() {
   test_manifest_decides_which_tables_are_live();
   test_directory_without_manifest_is_migrated();
   test_damaged_manifest_is_rejected();
+  test_manifest_appends_edits();
+  test_manifest_log_stays_bounded();
+  test_torn_manifest_tail_is_ignored();
+  test_corrupt_manifest_record_before_tail_fails_open();
+  test_version1_manifest_is_upgraded();
+  test_version2_table_is_read_and_migrated();
+  test_prefix_compression_shrinks_tables();
+  test_restart_points_find_every_key();
+  test_snapshot_sees_a_frozen_view();
+  test_released_snapshot_lets_versions_go();
+  test_snapshot_survives_leveled_compaction();
+  test_tombstone_kept_while_snapshot_needs_old_value();
+  test_concurrent_readers_writers_and_snapshots();
   if (failures != 0) {
     std::cerr << failures << " of " << assertions << " assertions failed\n";
     return 1;

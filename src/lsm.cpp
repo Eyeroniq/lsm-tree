@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cctype>
 #include <cstring>
@@ -9,12 +10,15 @@
 #include <fcntl.h>
 #include <limits>
 #include <list>
+#include <mutex>
+#include <thread>
 #include <set>
 #include <stdexcept>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <string_view>
 #include <utility>
 
 namespace lsm {
@@ -23,11 +27,17 @@ namespace {
 constexpr std::uint32_t kWalMagic = 0x314C4157U;     // WAL1
 constexpr std::uint32_t kTableMagic = 0x31545353U;   // SST1
 constexpr std::uint32_t kFooterMagic = 0x46545353U;  // SSTF
-// Version 1 tables are loaded whole into memory. Version 2 tables keep only
+// Version 1 tables are loaded whole into memory. Versions 2 and 3 keep only
 // a sparse block index and the Bloom filter in memory and read data blocks
-// on demand. Both are readable; new tables are always written as version 2.
+// on demand; version 3 blocks are prefix-compressed with restart points and
+// may hold several versions of a key. All are readable; new tables are
+// always written as version 3.
 constexpr std::uint32_t kTableVersion1 = 1;
 constexpr std::uint32_t kTableVersion2 = 2;
+constexpr std::uint32_t kTableVersion3 = 3;
+// Measured: 8 instead of 16 makes cached point reads about 14% faster for
+// about 4% larger tables.
+constexpr std::size_t kRestartInterval = 8;
 constexpr std::size_t kWalHeader = 24;
 constexpr std::size_t kV1Header = 24;
 constexpr std::size_t kV2Header = 8;
@@ -282,70 +292,93 @@ using Entry = LSMTree::Entry;
 using Table = LSMTree::Table;
 using EntryList = std::vector<std::pair<std::string, Entry>>;
 
+// A checksum-verified data block in the version 3 encoding: entries, then
+// the restart offsets and their count. Cached in this compact form.
+struct RawBlock {
+  std::vector<std::uint8_t> bytes;
+  std::size_t data_end = 0;  // Where the restart array begins.
+  std::uint32_t restart_count = 0;
+
+  std::uint32_t restart(std::size_t index) const {
+    return read_u32(bytes.data() + data_end + 4 * index);
+  }
+};
+
 }  // namespace
 
-// LRU cache of decoded, checksum-verified data blocks, keyed by
+// LRU cache of checksum-verified data blocks, keyed by
 // (table generation, block index). Generations are never reused while the
 // database is open, so a cached block can never go stale; blocks of tables
-// removed by compaction simply age out.
+// removed by compaction simply age out. Split into independently locked
+// shards so concurrent readers rarely touch the same lock or LRU list.
 struct LSMTree::BlockCache {
   using Key = std::pair<std::uint64_t, std::size_t>;
-  struct Slot {
-    Key key;
-    std::shared_ptr<const EntryList> block;
-    std::size_t charge;
-  };
+  static constexpr std::size_t kShards = 16;
 
-  explicit BlockCache(std::size_t capacity_bytes) : capacity(capacity_bytes) {}
+  explicit BlockCache(std::size_t capacity_bytes) {
+    for (auto& shard : shards) {
+      shard.capacity = capacity_bytes / kShards;
+    }
+  }
 
-  std::shared_ptr<const EntryList> find(const Key& key) {
-    const auto found = slots.find(key);
-    if (found == slots.end()) {
+  std::shared_ptr<const RawBlock> find(const Key& key) {
+    Shard& shard = shard_for(key);
+    std::lock_guard<std::mutex> guard(shard.mutex);
+    const auto found = shard.slots.find(key);
+    if (found == shard.slots.end()) {
       return nullptr;
     }
-    lru.splice(lru.begin(), lru, found->second);
-    ++hits;
+    shard.lru.splice(shard.lru.begin(), shard.lru, found->second);
+    hits.add();
     return found->second->block;
   }
 
-  void insert(const Key& key, std::shared_ptr<const EntryList> block,
+  void insert(const Key& key, std::shared_ptr<const RawBlock> block,
               std::size_t charge) {
-    if (charge > capacity || slots.count(key) != 0) {
+    Shard& shard = shard_for(key);
+    std::lock_guard<std::mutex> guard(shard.mutex);
+    if (charge > shard.capacity || shard.slots.count(key) != 0) {
       return;
     }
-    lru.push_front({key, std::move(block), charge});
-    slots[key] = lru.begin();
-    used += charge;
-    while (used > capacity) {
-      used -= lru.back().charge;
-      slots.erase(lru.back().key);
-      lru.pop_back();
+    shard.lru.push_front({key, std::move(block), charge});
+    shard.slots[key] = shard.lru.begin();
+    shard.used += charge;
+    while (shard.used > shard.capacity) {
+      shard.used -= shard.lru.back().charge;
+      shard.slots.erase(shard.lru.back().key);
+      shard.lru.pop_back();
     }
   }
 
-  std::size_t capacity;
-  std::size_t used = 0;
-  std::uint64_t hits = 0;
-  std::list<Slot> lru;  // Most recently used first.
-  std::map<Key, std::list<Slot>::iterator> slots;
+  struct Slot {
+    Key key;
+    std::shared_ptr<const RawBlock> block;
+    std::size_t charge;
+  };
+  struct alignas(64) Shard {
+    std::mutex mutex;
+    std::size_t capacity = 0;
+    std::size_t used = 0;
+    std::list<Slot> lru;  // Most recently used first.
+    std::map<Key, std::list<Slot>::iterator> slots;
+  };
+
+  Shard& shard_for(const Key& key) {
+    const std::uint64_t mixed =
+        (key.first * 0x9E3779B97F4A7C15ULL) ^ (key.second * 0xC2B2AE3D27D4EB4FULL);
+    return shards[(mixed >> 32) % kShards];
+  }
+
+  Shard shards[kShards];
+  detail::ShardedCounter hits;
 };
 
 namespace {
 
-// Entry encoding shared by both table versions:
+// Entry encoding of version 1 and 2 tables (read only; new tables use the
+// version 3 block encoding):
 //   [sequence u64 | tombstone u8 | 3 zero bytes | key_len u32 | value_len u32
 //    | key | value]
-void encode_entry(std::vector<std::uint8_t>& out, const std::string& key,
-                  const Entry& entry) {
-  append_u64(out, entry.sequence);
-  out.push_back(entry.tombstone ? 1 : 0);
-  out.insert(out.end(), 3, 0);
-  append_u32(out, static_cast<std::uint32_t>(key.size()));
-  append_u32(out, static_cast<std::uint32_t>(entry.value.size()));
-  out.insert(out.end(), key.begin(), key.end());
-  out.insert(out.end(), entry.value.begin(), entry.value.end());
-}
-
 // Decodes the entry at `offset` (which must be <= limit) and advances past it.
 void decode_entry(const std::uint8_t* data, std::size_t limit,
                   std::size_t& offset, std::string& key, Entry& entry) {
@@ -489,7 +522,9 @@ void load_v2(Table& table, std::size_t size) {
     handle.size = read_u32(index.data() + position + 8);
     position += 12;
     if (handle.offset != expected_offset ||
-        handle.size < kEntryHeader + 1 + kChecksum ||
+        handle.size < (table.version == kTableVersion2
+                           ? kEntryHeader + 1 + kChecksum
+                           : 4 + 1 + 4 + 4 + kChecksum) ||
         handle.size > index_offset - handle.offset) {
       throw std::runtime_error("invalid SSTable block extent");
     }
@@ -541,7 +576,8 @@ std::shared_ptr<Table> load_table(const std::filesystem::path& path) {
       table->smallest = table->entries.front().first;
       table->largest = table->entries.back().first;
     }
-  } else if (table->version == kTableVersion2) {
+  } else if (table->version == kTableVersion2 ||
+             table->version == kTableVersion3) {
     load_v2(*table, size);
     if (!table->index.empty()) {
       // The smallest key needs a block read; the caller supplies it, from
@@ -554,9 +590,8 @@ std::shared_ptr<Table> load_table(const std::filesystem::path& path) {
   return table;
 }
 
-// Reads one data block of a version 2 table and verifies its checksum and
-// its agreement with the index.
-EntryList read_block(const Table& table, std::size_t block) {
+// Version 2 data block: entries in the fixed encoding above, then a CRC32.
+EntryList read_block_v2(const Table& table, std::size_t block) {
   const BlockHandle& handle = table.index[block];
   std::vector<std::uint8_t> bytes(handle.size);
   if (!read_exact(table.fd, handle.offset, bytes.data(), bytes.size())) {
@@ -585,17 +620,286 @@ EntryList read_block(const Table& table, std::size_t block) {
   return entries;
 }
 
-// Ordered iteration over one table, for either format. Holds at most one
-// data block of a version 2 table. With a null cache every block comes from
-// disk and nothing is cached (compaction uses this to avoid evicting the
-// blocks that serve reads).
+void put_varint(std::vector<std::uint8_t>& out, std::uint64_t value) {
+  while (value >= 0x80) {
+    out.push_back(static_cast<std::uint8_t>(value | 0x80));
+    value >>= 7;
+  }
+  out.push_back(static_cast<std::uint8_t>(value));
+}
+
+// Decodes the varint at `offset`, advancing it; throws if it runs past
+// `limit` or is longer than ten bytes.
+std::uint64_t get_varint(const std::uint8_t* data, std::size_t limit,
+                         std::size_t& offset) {
+  std::uint64_t value = 0;
+  for (int shift = 0; shift <= 63; shift += 7) {
+    if (offset >= limit) {
+      throw std::runtime_error("truncated SSTable entry");
+    }
+    const std::uint8_t byte = data[offset++];
+    value |= static_cast<std::uint64_t>(byte & 0x7FU) << shift;
+    if ((byte & 0x80U) == 0) {
+      return value;
+    }
+  }
+  throw std::runtime_error("invalid SSTable varint");
+}
+
+// Builds one data block in the version 3 encoding:
+//   entry:   [shared varint | unshared varint | value_len varint |
+//             (sequence << 1 | tombstone) varint | key suffix | value]
+//   trailer: [restart offset u32]... [restart count u32]
+// Each key stores only the bytes it does not share with the previous key.
+// Every kRestartInterval-th entry stores its whole key and is listed as a
+// restart point, so a lookup binary-searches the restarts and then decodes
+// at most kRestartInterval entries. Entries are ordered by key, and versions
+// of one key by descending sequence.
+class BlockBuilder {
+ public:
+  void add(const std::string& key, const Entry& entry) {
+    std::size_t shared = 0;
+    if (counter_ < kRestartInterval) {
+      const std::size_t limit = std::min(last_key_.size(), key.size());
+      while (shared < limit && last_key_[shared] == key[shared]) {
+        ++shared;
+      }
+    } else {
+      restarts_.push_back(static_cast<std::uint32_t>(buffer_.size()));
+      counter_ = 0;
+    }
+    put_varint(buffer_, shared);
+    put_varint(buffer_, key.size() - shared);
+    put_varint(buffer_, entry.value.size());
+    put_varint(buffer_, (entry.sequence << 1) | (entry.tombstone ? 1U : 0U));
+    buffer_.insert(buffer_.end(), key.begin() + static_cast<std::ptrdiff_t>(shared),
+                   key.end());
+    buffer_.insert(buffer_.end(), entry.value.begin(), entry.value.end());
+    last_key_ = key;
+    ++counter_;
+  }
+
+  bool empty() const { return buffer_.empty(); }
+
+  // Size of the block if finished now.
+  std::size_t size() const { return buffer_.size() + 4 * restarts_.size() + 4; }
+
+  std::vector<std::uint8_t> finish() {
+    std::vector<std::uint8_t> block = std::move(buffer_);
+    for (const std::uint32_t restart : restarts_) {
+      append_u32(block, restart);
+    }
+    append_u32(block, static_cast<std::uint32_t>(restarts_.size()));
+    buffer_.clear();
+    restarts_.assign(1, 0);
+    counter_ = 0;
+    last_key_.clear();
+    return block;
+  }
+
+ private:
+  std::vector<std::uint8_t> buffer_;
+  std::vector<std::uint32_t> restarts_{0};
+  std::size_t counter_ = 0;
+  std::string last_key_;
+};
+
+// Validates the restart trailer of a block (CRC already stripped).
+std::shared_ptr<const RawBlock> parse_block(std::vector<std::uint8_t> bytes) {
+  if (bytes.size() < 8) {
+    throw std::runtime_error("SSTable block is too small");
+  }
+  const std::uint32_t count = read_u32(bytes.data() + bytes.size() - 4);
+  if (count == 0 || count > (bytes.size() - 4) / 4) {
+    throw std::runtime_error("invalid SSTable block restarts");
+  }
+  auto block = std::make_shared<RawBlock>();
+  block->data_end = bytes.size() - 4 - 4 * static_cast<std::size_t>(count);
+  block->restart_count = count;
+  block->bytes = std::move(bytes);
+  if (block->data_end == 0) {
+    throw std::runtime_error("empty SSTable block");
+  }
+  for (std::uint32_t index = 0; index < count; ++index) {
+    const std::uint32_t restart = block->restart(index);
+    if (restart >= block->data_end ||
+        (index == 0 ? restart != 0 : restart <= block->restart(index - 1))) {
+      throw std::runtime_error("invalid SSTable block restarts");
+    }
+  }
+  return block;
+}
+
+// Iterates one block in the version 3 encoding.
+class BlockIterator {
+ public:
+  BlockIterator() = default;
+  explicit BlockIterator(std::shared_ptr<const RawBlock> block)
+      : block_(std::move(block)) {}
+
+  bool valid() const { return valid_; }
+  const std::string& key() const { return key_; }
+
+  // The value is copied out of the block only when asked for, so stepping
+  // past entries during a seek costs no allocation.
+  const Entry& entry() const {
+    if (!value_ready_) {
+      entry_.value.assign(value_, value_length_);
+      value_ready_ = true;
+    }
+    return entry_;
+  }
+
+  void seek_to_first() { decode_at(0, true); }
+
+  void next() {
+    if (next_ >= block_->data_end) {
+      valid_ = false;
+      return;
+    }
+    decode_at(next_, false);
+  }
+
+  // Positions at the first entry whose key is >= target (for a key with
+  // several versions, its newest).
+  void seek(const std::string& target) {
+    std::size_t low = 0;
+    std::size_t high = block_->restart_count;
+    const std::string_view wanted(target);
+    while (low < high) {
+      const std::size_t middle = low + (high - low) / 2;
+      if (restart_key(middle) < wanted) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    decode_at(block_->restart(low == 0 ? 0 : low - 1), true);
+    while (valid_ && key_ < target) {
+      next();
+    }
+  }
+
+ private:
+  struct Header {
+    std::uint64_t shared;
+    std::uint64_t unshared;
+    std::uint64_t value_length;
+    std::uint64_t packed;
+    std::size_t key_offset;
+  };
+
+  Header header_at(std::size_t offset) const {
+    const std::uint8_t* data = block_->bytes.data();
+    const std::size_t limit = block_->data_end;
+    Header header{};
+    std::size_t position = offset;
+    header.shared = get_varint(data, limit, position);
+    header.unshared = get_varint(data, limit, position);
+    header.value_length = get_varint(data, limit, position);
+    header.packed = get_varint(data, limit, position);
+    header.key_offset = position;
+    if (header.unshared > limit - position ||
+        header.value_length > limit - position - header.unshared ||
+        header.shared + header.unshared == 0 ||
+        header.shared + header.unshared > kMaxKey ||
+        header.value_length > kMaxValue) {
+      throw std::runtime_error("invalid SSTable entry length");
+    }
+    return header;
+  }
+
+  // The full key stored at a restart point, viewed in place.
+  std::string_view restart_key(std::size_t index) const {
+    const Header header = header_at(block_->restart(index));
+    if (header.shared != 0) {
+      throw std::runtime_error("SSTable restart point shares a prefix");
+    }
+    return std::string_view(
+        reinterpret_cast<const char*>(block_->bytes.data() + header.key_offset),
+        header.unshared);
+  }
+
+  void decode_at(std::size_t offset, bool restart) {
+    const Header header = header_at(offset);
+    if ((restart && header.shared != 0) || header.shared > key_.size()) {
+      throw std::runtime_error("invalid SSTable key prefix");
+    }
+    const char* suffix =
+        reinterpret_cast<const char*>(block_->bytes.data() + header.key_offset);
+    const std::string_view new_suffix(suffix, header.unshared);
+    const std::uint64_t sequence = header.packed >> 1;
+    if (!restart && valid_) {
+      // The new key shares `shared` bytes with the current one, so their
+      // order is decided by the rest.
+      const int order =
+          new_suffix.compare(std::string_view(key_).substr(header.shared));
+      if (order < 0 || (order == 0 && sequence >= entry_.sequence)) {
+        throw std::runtime_error("SSTable keys are not in order");
+      }
+    }
+    const bool tombstone = (header.packed & 1U) != 0;
+    if (tombstone && header.value_length != 0) {
+      throw std::runtime_error("tombstone has a value");
+    }
+    // Rebuild the key in its existing buffer.
+    key_.resize(restart ? 0 : header.shared);
+    key_.append(new_suffix);
+    entry_.sequence = sequence;
+    entry_.tombstone = tombstone;
+    value_ = suffix + header.unshared;
+    value_length_ = header.value_length;
+    value_ready_ = false;
+    next_ = header.key_offset + header.unshared + header.value_length;
+    valid_ = true;
+  }
+
+  std::shared_ptr<const RawBlock> block_;
+  std::string key_;
+  mutable Entry entry_;
+  const char* value_ = nullptr;
+  std::size_t value_length_ = 0;
+  mutable bool value_ready_ = false;
+  std::size_t next_ = 0;
+  bool valid_ = false;
+};
+
+// Reads, checksums and parses one data block of a version 2 or 3 table.
+// Version 2 blocks are re-encoded in the version 3 form, so the cache and
+// the cursor deal with a single encoding.
+std::shared_ptr<const RawBlock> read_block(const Table& table,
+                                           std::size_t block) {
+  if (table.version == kTableVersion2) {
+    BlockBuilder builder;
+    for (const auto& [key, entry] : read_block_v2(table, block)) {
+      builder.add(key, entry);
+    }
+    return parse_block(builder.finish());
+  }
+  const BlockHandle& handle = table.index[block];
+  std::vector<std::uint8_t> bytes(handle.size);
+  if (!read_exact(table.fd, handle.offset, bytes.data(), bytes.size())) {
+    throw std::runtime_error("short SSTable block read");
+  }
+  const std::size_t limit = bytes.size() - kChecksum;
+  if (crc32(bytes.data(), limit) != read_u32(bytes.data() + limit)) {
+    throw std::runtime_error("SSTable block checksum mismatch in " +
+                             table.path.filename().string());
+  }
+  bytes.resize(limit);
+  return parse_block(std::move(bytes));
+}
+
+// Ordered iteration over one table, for any format. Holds at most one data
+// block. With a null cache every block comes from disk and nothing is cached
+// (compaction uses this to avoid evicting the blocks that serve reads).
 class TableCursor {
  public:
   TableCursor(const Table& table, LSMTree::BlockCache* cache,
-              std::uint64_t& block_reads)
+              detail::ShardedCounter& block_reads)
       : table_(table), cache_(cache), block_reads_(block_reads) {}
 
-  // Positions at the first key >= target.
+  // Positions at the first entry whose key is >= target.
   void seek(const std::string& target) {
     if (table_.version == kTableVersion1) {
       position_ = static_cast<std::size_t>(
@@ -612,77 +916,80 @@ class TableCursor {
                            return handle.last_key < key;
                          }) -
         table_.index.begin());
-    position_ = 0;
-    block_entries_.reset();
     if (block_ == table_.index.size()) {
+      iterator_ = BlockIterator();
       return;
     }
     load_block();
-    // The block's last key is >= target, so this lands inside the block.
-    position_ = static_cast<std::size_t>(
-        std::lower_bound(block_entries_->begin(), block_entries_->end(), target,
-                         [](const auto& item, const std::string& key) {
-                           return item.first < key;
-                         }) -
-        block_entries_->begin());
+    iterator_.seek(target);
+    if (!iterator_.valid()) {
+      advance_block();
+    }
   }
 
   bool valid() const {
-    if (table_.version == kTableVersion1) {
-      return position_ < table_.entries.size();
-    }
-    return block_entries_ != nullptr && position_ < block_entries_->size();
+    return table_.version == kTableVersion1
+               ? position_ < table_.entries.size()
+               : iterator_.valid();
   }
 
-  const std::string& key() const { return current().first; }
-  const Entry& entry() const { return current().second; }
+  const std::string& key() const {
+    return table_.version == kTableVersion1 ? table_.entries[position_].first
+                                            : iterator_.key();
+  }
+
+  const Entry& entry() const {
+    return table_.version == kTableVersion1 ? table_.entries[position_].second
+                                            : iterator_.entry();
+  }
 
   void next() {
-    ++position_;
-    if (table_.version == kTableVersion2 &&
-        position_ == block_entries_->size()) {
-      ++block_;
-      position_ = 0;
-      block_entries_.reset();
-      if (block_ < table_.index.size()) {
-        load_block();
-      }
+    if (table_.version == kTableVersion1) {
+      ++position_;
+      return;
+    }
+    iterator_.next();
+    if (!iterator_.valid()) {
+      advance_block();
     }
   }
 
  private:
-  const std::pair<std::string, Entry>& current() const {
-    return table_.version == kTableVersion1 ? table_.entries[position_]
-                                            : (*block_entries_)[position_];
+  void advance_block() {
+    ++block_;
+    if (block_ < table_.index.size()) {
+      load_block();
+      iterator_.seek_to_first();
+    } else {
+      iterator_ = BlockIterator();
+    }
   }
 
   void load_block() {
     const LSMTree::BlockCache::Key key{table_.generation, block_};
+    std::shared_ptr<const RawBlock> block;
     if (cache_ != nullptr) {
-      block_entries_ = cache_->find(key);
-      if (block_entries_ != nullptr) {
-        return;
+      block = cache_->find(key);
+    }
+    if (block == nullptr) {
+      block = read_block(table_, block_);
+      block_reads_.add();
+      if (cache_ != nullptr) {
+        cache_->insert(key, block, block->bytes.size() + 64);
       }
     }
-    auto loaded = std::make_shared<const EntryList>(read_block(table_, block_));
-    ++block_reads_;
-    if (cache_ != nullptr) {
-      // Charge the on-disk size plus a rough per-entry allocation overhead.
-      cache_->insert(key, loaded,
-                     table_.index[block_].size + loaded->size() * 64);
-    }
-    block_entries_ = std::move(loaded);
+    iterator_ = BlockIterator(std::move(block));
   }
 
   const Table& table_;
   LSMTree::BlockCache* cache_;
-  std::uint64_t& block_reads_;
+  detail::ShardedCounter& block_reads_;
   std::size_t block_ = 0;
   std::size_t position_ = 0;
-  std::shared_ptr<const EntryList> block_entries_;
+  BlockIterator iterator_;
 };
 
-// Streams sorted entries into a new version 2 table. Memory use is one data
+// Streams sorted entries into a new version 3 table. Memory use is one data
 // block plus the index and Bloom filter, regardless of table size.
 class TableWriter {
  public:
@@ -696,7 +1003,7 @@ class TableWriter {
     }
     std::vector<std::uint8_t> header;
     append_u32(header, kTableMagic);
-    append_u32(header, kTableVersion2);
+    append_u32(header, kTableVersion3);
     write(header);
   }
 
@@ -709,16 +1016,22 @@ class TableWriter {
     }
   }
 
-  // Keys must arrive in strictly increasing order.
+  // Entries must arrive ordered by key, and versions of one key by
+  // descending sequence.
   void add(const std::string& key, const Entry& entry) {
-    encode_entry(block_, key, entry);
-    last_key_ = key;
-    bloom_.add(key);
-    max_sequence_ = std::max(max_sequence_, entry.sequence);
-    ++count_;
-    if (block_.size() >= block_bytes_) {
+    const bool new_key = count_ == 0 || key != last_key_;
+    // Blocks are cut only between different keys, so all versions of a key
+    // share one block and index keys stay strictly increasing.
+    if (new_key && !block_.empty() && block_.size() >= block_bytes_) {
       flush_block();
     }
+    if (new_key) {
+      bloom_.add(key);
+    }
+    block_.add(key, entry);
+    last_key_ = key;
+    max_sequence_ = std::max(max_sequence_, entry.sequence);
+    ++count_;
   }
 
   // Bytes written so far; after finish(), the size of the file.
@@ -759,13 +1072,13 @@ class TableWriter {
     if (block_.empty()) {
       return;
     }
-    append_u32(block_, crc32(block_.data(), block_.size()));
+    std::vector<std::uint8_t> bytes = block_.finish();
+    append_u32(bytes, crc32(bytes.data(), bytes.size()));
     append_u32(index_, static_cast<std::uint32_t>(last_key_.size()));
     index_.insert(index_.end(), last_key_.begin(), last_key_.end());
     append_u64(index_, offset_);
-    append_u32(index_, static_cast<std::uint32_t>(block_.size()));
-    write(block_);
-    block_.clear();
+    append_u32(index_, static_cast<std::uint32_t>(bytes.size()));
+    write(bytes);
   }
 
   void write(const std::vector<std::uint8_t>& bytes) {
@@ -777,7 +1090,7 @@ class TableWriter {
   Bloom bloom_;
   int fd_ = -1;
   std::uint64_t offset_ = 0;
-  std::vector<std::uint8_t> block_;
+  BlockBuilder block_;
   std::vector<std::uint8_t> index_;
   std::string last_key_;
   std::uint64_t count_ = 0;
@@ -800,8 +1113,26 @@ void build_table(const std::filesystem::path& path, const Options& options,
   }
 }
 
-constexpr std::uint32_t kManifestMagic = 0x314E414DU;  // MAN1
-constexpr std::uint32_t kManifestVersion = 1;
+// MANIFEST version 2 is a log: [magic | version] then records
+//   [payload_len u32 | type u8 | payload | CRC32 of type + payload]
+// The first record is always a full snapshot; later records are edits.
+//   snapshot payload: [next_generation u64 | count u32 | entry...]
+//   edit payload:     [next_generation u64 | removed u32 | generation u64... |
+//                      added u32 | entry...]
+//   entry:            [generation u64 | level u32 | smallest_len u32 |
+//                      smallest | largest_len u32 | largest]
+// A commit appends one edit and fsyncs. When the log has grown well past its
+// snapshot it is rewritten as a single snapshot (tmp, fsync, rename, fsync
+// directory). Version 1 (MAN1) was one snapshot with a trailing CRC; it is
+// read and rewritten as version 2.
+constexpr std::uint32_t kManifestMagicV1 = 0x314E414DU;  // MAN1
+constexpr std::uint32_t kManifestMagic = 0x324E414DU;    // MAN2
+constexpr std::uint32_t kManifestVersion = 2;
+constexpr std::size_t kManifestHeader = 8;
+constexpr std::size_t kManifestRecordHeader = 5;
+constexpr std::uint8_t kManifestSnapshot = 1;
+constexpr std::uint8_t kManifestEdit = 2;
+constexpr std::uint64_t kManifestRewriteBytes = 64 * 1024;
 constexpr std::size_t kMaxLevels = 7;
 
 struct ManifestTable {
@@ -813,12 +1144,105 @@ struct ManifestTable {
 
 struct Manifest {
   std::uint64_t next_generation = 1;
-  std::vector<ManifestTable> tables;
+  std::map<std::uint64_t, ManifestTable> tables;
+  // Old format or an uncommitted (torn) final edit: rewrite on open.
+  bool needs_rewrite = false;
+  std::uint64_t snapshot_bytes = 0;
 };
 
-// MANIFEST: [magic | version | next_generation u64 | count u32 |
-//            (generation u64 | level u32 | smallest_len u32 | smallest |
-//             largest_len u32 | largest)... | CRC32]
+// Bounds-checked reader over one MANIFEST payload.
+struct ManifestReader {
+  const std::uint8_t* data;
+  std::size_t size;
+  std::size_t position = 0;
+
+  void need(std::size_t count) const {
+    if (size - position < count) {
+      throw std::runtime_error("truncated MANIFEST record");
+    }
+  }
+  std::uint32_t u32() {
+    need(4);
+    const std::uint32_t value = read_u32(data + position);
+    position += 4;
+    return value;
+  }
+  std::uint64_t u64() {
+    need(8);
+    const std::uint64_t value = read_u64(data + position);
+    position += 8;
+    return value;
+  }
+  std::string key() {
+    const std::uint32_t length = u32();
+    if (length > kMaxKey) {
+      throw std::runtime_error("invalid MANIFEST key length");
+    }
+    need(length);
+    std::string value(reinterpret_cast<const char*>(data + position), length);
+    position += length;
+    return value;
+  }
+  ManifestTable entry() {
+    ManifestTable table;
+    table.generation = u64();
+    table.level = u32();
+    table.smallest = key();
+    table.largest = key();
+    if (table.generation == 0 || table.level >= kMaxLevels) {
+      throw std::runtime_error("invalid MANIFEST table entry");
+    }
+    return table;
+  }
+};
+
+void append_manifest_entry(std::vector<std::uint8_t>& out,
+                           std::uint64_t generation, std::size_t level,
+                           const std::string& smallest,
+                           const std::string& largest) {
+  append_u64(out, generation);
+  append_u32(out, static_cast<std::uint32_t>(level));
+  append_u32(out, static_cast<std::uint32_t>(smallest.size()));
+  out.insert(out.end(), smallest.begin(), smallest.end());
+  append_u32(out, static_cast<std::uint32_t>(largest.size()));
+  out.insert(out.end(), largest.begin(), largest.end());
+}
+
+std::vector<std::uint8_t> manifest_record(std::uint8_t type,
+                                          const std::vector<std::uint8_t>& payload) {
+  std::vector<std::uint8_t> record;
+  append_u32(record, static_cast<std::uint32_t>(payload.size()));
+  record.push_back(type);
+  record.insert(record.end(), payload.begin(), payload.end());
+  append_u32(record, crc32(record.data() + 4, 1 + payload.size()));
+  return record;
+}
+
+Manifest read_manifest_v1(const std::vector<std::uint8_t>& bytes) {
+  const std::size_t limit = bytes.size() - kChecksum;
+  if (crc32(bytes.data(), limit) != read_u32(bytes.data() + limit)) {
+    throw std::runtime_error("MANIFEST checksum mismatch");
+  }
+  if (read_u32(bytes.data() + 4) != 1) {
+    throw std::runtime_error("unsupported MANIFEST header");
+  }
+  ManifestReader reader{bytes.data(), limit, 8};
+  Manifest manifest;
+  manifest.next_generation = reader.u64();
+  const std::uint32_t count = reader.u32();
+  for (std::uint32_t index = 0; index < count; ++index) {
+    ManifestTable table = reader.entry();
+    if (!manifest.tables.emplace(table.generation, table).second) {
+      throw std::runtime_error("MANIFEST lists a table twice");
+    }
+  }
+  if (reader.position != limit) {
+    throw std::runtime_error("unexpected bytes after MANIFEST entries");
+  }
+  manifest.needs_rewrite = true;
+  return manifest;
+}
+
 // Returns nullopt when the file does not exist, which means the directory
 // predates levels: every table in it is then treated as level 0.
 std::optional<Manifest> read_manifest(const std::filesystem::path& path) {
@@ -845,57 +1269,94 @@ std::optional<Manifest> read_manifest(const std::filesystem::path& path) {
   }
   ::close(fd);
 
-  if (bytes.size() < 24) {
+  if (bytes.size() < kManifestHeader + kChecksum) {
     throw std::runtime_error("MANIFEST is too small");
   }
-  const std::size_t limit = bytes.size() - kChecksum;
-  if (crc32(bytes.data(), limit) != read_u32(bytes.data() + limit)) {
-    throw std::runtime_error("MANIFEST checksum mismatch");
+  if (read_u32(bytes.data()) == kManifestMagicV1) {
+    return read_manifest_v1(bytes);
   }
   if (read_u32(bytes.data()) != kManifestMagic ||
       read_u32(bytes.data() + 4) != kManifestVersion) {
     throw std::runtime_error("unsupported MANIFEST header");
   }
+
   Manifest manifest;
-  manifest.next_generation = read_u64(bytes.data() + 8);
-  const std::uint32_t count = read_u32(bytes.data() + 16);
-  std::size_t position = 20;
-  const auto take_key = [&](std::string& out) {
-    if (limit - position < 4) {
-      throw std::runtime_error("truncated MANIFEST");
+  const std::size_t size = bytes.size();
+  std::size_t position = kManifestHeader;
+  bool first = true;
+  while (position < size) {
+    // An append cut short by a crash leaves an incomplete final record: that
+    // edit was never committed. The first record was written whole (tmp file,
+    // rename), so damage there is corruption.
+    if (size - position < kManifestRecordHeader + kChecksum ||
+        read_u32(bytes.data() + position) >
+            size - position - kManifestRecordHeader - kChecksum) {
+      if (first) {
+        throw std::runtime_error("MANIFEST snapshot is truncated");
+      }
+      manifest.needs_rewrite = true;
+      break;
     }
     const std::uint32_t length = read_u32(bytes.data() + position);
-    position += 4;
-    if (length > kMaxKey || limit - position < length) {
-      throw std::runtime_error("invalid MANIFEST key length");
+    const std::uint8_t type = bytes[position + 4];
+    const std::size_t end = position + kManifestRecordHeader + length + kChecksum;
+    if (crc32(bytes.data() + position + 4, 1 + length) !=
+        read_u32(bytes.data() + end - kChecksum)) {
+      // Only the very last record may be a torn append. A bad record with
+      // valid records after it means the file is damaged, and trusting a
+      // prefix could treat newer live tables as orphans and delete them.
+      if (first || end != size) {
+        throw std::runtime_error("MANIFEST is corrupt");
+      }
+      manifest.needs_rewrite = true;
+      break;
     }
-    out.assign(reinterpret_cast<const char*>(bytes.data() + position), length);
-    position += length;
-  };
-  for (std::uint32_t index = 0; index < count; ++index) {
-    if (limit - position < 12) {
-      throw std::runtime_error("truncated MANIFEST");
+    ManifestReader reader{bytes.data() + position + kManifestRecordHeader,
+                          length};
+    const std::uint64_t next_generation = reader.u64();
+    if (type == kManifestSnapshot) {
+      manifest.tables.clear();
+      const std::uint32_t count = reader.u32();
+      for (std::uint32_t index = 0; index < count; ++index) {
+        ManifestTable table = reader.entry();
+        if (!manifest.tables.emplace(table.generation, table).second) {
+          throw std::runtime_error("MANIFEST lists a table twice");
+        }
+      }
+      manifest.snapshot_bytes = end;
+    } else if (type == kManifestEdit && !first) {
+      const std::uint32_t removed = reader.u32();
+      for (std::uint32_t index = 0; index < removed; ++index) {
+        if (manifest.tables.erase(reader.u64()) == 0) {
+          throw std::runtime_error("MANIFEST edit removes an unknown table");
+        }
+      }
+      const std::uint32_t added = reader.u32();
+      for (std::uint32_t index = 0; index < added; ++index) {
+        ManifestTable table = reader.entry();
+        if (!manifest.tables.emplace(table.generation, table).second) {
+          throw std::runtime_error("MANIFEST edit adds a table twice");
+        }
+      }
+    } else {
+      throw std::runtime_error("invalid MANIFEST record type");
     }
-    ManifestTable table;
-    table.generation = read_u64(bytes.data() + position);
-    table.level = read_u32(bytes.data() + position + 8);
-    position += 12;
-    take_key(table.smallest);
-    take_key(table.largest);
-    if (table.generation == 0 || table.level >= kMaxLevels) {
-      throw std::runtime_error("invalid MANIFEST table entry");
+    if (reader.position != length) {
+      throw std::runtime_error("unexpected bytes in MANIFEST record");
     }
-    manifest.tables.push_back(std::move(table));
+    manifest.next_generation = next_generation;
+    first = false;
+    position = end;
   }
-  if (position != limit) {
-    throw std::runtime_error("unexpected bytes after MANIFEST entries");
+  if (first) {
+    throw std::runtime_error("MANIFEST has no snapshot");
   }
   return manifest;
 }
 
 // Smallest key of a table, reading its first block if necessary.
 std::string first_key(const Table& table) {
-  std::uint64_t ignored = 0;
+  detail::ShardedCounter ignored;
   TableCursor cursor(table, nullptr, ignored);
   cursor.seek("");
   return cursor.valid() ? cursor.key() : std::string();
@@ -909,10 +1370,37 @@ bool overlaps(const Table& table, const std::string& smallest,
 
 }  // namespace
 
+// Sequences of live snapshots. Shared with each Snapshot, so a snapshot that
+// outlives its database stays safe to release.
+struct Snapshot::Registry {
+  bool any() const {
+    std::lock_guard<std::mutex> guard(mutex);
+    return !live.empty();
+  }
+  // The oldest sequence any reader may still read at: the oldest snapshot,
+  // or `latest` when there is none.
+  std::uint64_t smallest(std::uint64_t latest) const {
+    std::lock_guard<std::mutex> guard(mutex);
+    return live.empty() ? latest : *live.begin();
+  }
+
+  mutable std::mutex mutex;
+  std::multiset<std::uint64_t> live;
+};
+
+Snapshot::Snapshot(std::uint64_t sequence, std::shared_ptr<Registry> registry)
+    : sequence_(sequence), registry_(std::move(registry)) {
+  std::lock_guard<std::mutex> guard(registry_->mutex);
+  registry_->live.insert(sequence_);
+}
+
+Snapshot::~Snapshot() {
+  std::lock_guard<std::mutex> guard(registry_->mutex);
+  registry_->live.erase(registry_->live.find(sequence_));
+}
+
 LSMTree::LSMTree(std::filesystem::path directory, Options options)
-    : directory_(std::move(directory)),
-      wal_path_(directory_ / "active.wal"),
-      options_(options) {
+    : directory_(std::move(directory)), options_(options) {
   if (options_.memtable_bytes == 0 || options_.bloom_bits_per_key == 0 ||
       options_.compaction_trigger < 2 || options_.block_bytes == 0 ||
       options_.table_bytes == 0 || options_.level1_bytes == 0 ||
@@ -920,29 +1408,45 @@ LSMTree::LSMTree(std::filesystem::path directory, Options options)
     throw std::invalid_argument("invalid LSM options");
   }
   block_cache_ = std::make_unique<BlockCache>(options_.block_cache_bytes);
+  snapshots_ = std::make_shared<Snapshot::Registry>();
   std::filesystem::create_directories(directory_);
   acquire_lock();
   try {
     open_tables();
-    wal_fd_ = ::open(wal_path_.c_str(), O_CREAT | O_RDWR | O_APPEND, 0644);
-    if (wal_fd_ < 0) {
-      system_error("open WAL");
-    }
-    recover_wal();
+    open_wals();
   } catch (...) {
     if (wal_fd_ >= 0) {
       ::close(wal_fd_);
       wal_fd_ = -1;
     }
+    if (manifest_fd_ >= 0) {
+      ::close(manifest_fd_);
+      manifest_fd_ = -1;
+    }
     ::close(lock_fd_);
     lock_fd_ = -1;
     throw;
   }
+  published_ = std::make_shared<const Levels>(levels_);
+  worker_ = std::thread([this] { background_loop(); });
 }
 
 LSMTree::~LSMTree() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stopping_ = true;
+  }
+  work_cv_.notify_all();
+  // Finishes the current flush or compaction step, if any. A memtable still
+  // waiting to be flushed needs nothing: its WAL is replayed on open.
+  if (worker_.joinable()) {
+    worker_.join();
+  }
   if (wal_fd_ >= 0) {
     ::close(wal_fd_);
+  }
+  if (manifest_fd_ >= 0) {
+    ::close(manifest_fd_);
   }
   if (lock_fd_ >= 0) {
     ::close(lock_fd_);  // Releases the flock.
@@ -1003,7 +1507,7 @@ void LSMTree::open_tables() {
     // The MANIFEST alone decides which tables are live.
     next_generation_ = std::max(next_generation_, manifest->next_generation);
     std::set<std::uint64_t> live;
-    for (const auto& entry : manifest->tables) {
+    for (const auto& [listed, entry] : manifest->tables) {
       const auto file = files.find(entry.generation);
       if (file == files.end()) {
         throw std::runtime_error("MANIFEST references missing table sst-" +
@@ -1066,38 +1570,45 @@ void LSMTree::open_tables() {
       sequence_ = std::max(sequence_, table->max_sequence);
     }
   }
-  if (!manifest) {
-    write_manifest(levels_);
+  if (!manifest || manifest->needs_rewrite) {
+    rewrite_manifest();
+  } else {
+    const auto path = directory_ / "MANIFEST";
+    manifest_fd_ = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (manifest_fd_ < 0) {
+      system_error("open MANIFEST");
+    }
+    manifest_bytes_ = std::filesystem::file_size(path);
+    manifest_snapshot_bytes_ = manifest->snapshot_bytes;
   }
 }
 
-// Atomically replaces MANIFEST: write MANIFEST.tmp, fsync, rename, fsync the
-// directory. A failure before the rename leaves the old MANIFEST in force;
-// a failure after it leaves the outcome unknown, so writes are refused until
-// the database is reopened.
-void LSMTree::write_manifest(const Levels& levels) {
+// Writes the current levels as a fresh single-snapshot MANIFEST: write
+// MANIFEST.tmp, fsync, rename, fsync the directory. A failure before the
+// rename leaves the old MANIFEST in force; a failure after it leaves the
+// outcome unknown, so writes are refused until the database is reopened.
+void LSMTree::rewrite_manifest() {
+  std::vector<std::uint8_t> payload;
+  append_u64(payload, next_generation_);
+  std::uint32_t count = 0;
+  for (const auto& tables : levels_) {
+    count += static_cast<std::uint32_t>(tables.size());
+  }
+  append_u32(payload, count);
+  for (std::size_t level = 0; level < levels_.size(); ++level) {
+    for (const auto& table : levels_[level]) {
+      append_manifest_entry(payload, table->generation, level, table->smallest,
+                            table->largest);
+    }
+  }
   std::vector<std::uint8_t> bytes;
   append_u32(bytes, kManifestMagic);
   append_u32(bytes, kManifestVersion);
-  append_u64(bytes, next_generation_);
-  std::uint32_t count = 0;
-  for (const auto& tables : levels) {
-    count += static_cast<std::uint32_t>(tables.size());
-  }
-  append_u32(bytes, count);
-  for (std::size_t level = 0; level < levels.size(); ++level) {
-    for (const auto& table : levels[level]) {
-      append_u64(bytes, table->generation);
-      append_u32(bytes, static_cast<std::uint32_t>(level));
-      append_u32(bytes, static_cast<std::uint32_t>(table->smallest.size()));
-      bytes.insert(bytes.end(), table->smallest.begin(), table->smallest.end());
-      append_u32(bytes, static_cast<std::uint32_t>(table->largest.size()));
-      bytes.insert(bytes.end(), table->largest.begin(), table->largest.end());
-    }
-  }
-  append_u32(bytes, crc32(bytes.data(), bytes.size()));
+  const auto record = manifest_record(kManifestSnapshot, payload);
+  bytes.insert(bytes.end(), record.begin(), record.end());
 
   const auto temporary = directory_ / "MANIFEST.tmp";
+  const auto manifest = directory_ / "MANIFEST";
   const auto fail = [&](const char* operation) {
     const int saved = errno;
     std::error_code ignored;
@@ -1127,81 +1638,243 @@ void LSMTree::write_manifest(const Levels& levels) {
   if (::close(fd) != 0) {
     fail("close MANIFEST");
   }
-  if (::rename(temporary.c_str(), (directory_ / "MANIFEST").c_str()) != 0) {
+  if (::rename(temporary.c_str(), manifest.c_str()) != 0) {
     fail("rename MANIFEST");
   }
   try {
     sync_directory();
+    if (manifest_fd_ >= 0) {
+      ::close(manifest_fd_);
+    }
+    manifest_fd_ = ::open(manifest.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (manifest_fd_ < 0) {
+      system_error("open MANIFEST");
+    }
   } catch (...) {
     failed_ = true;
     throw;
   }
+  manifest_bytes_ = bytes.size();
+  manifest_snapshot_bytes_ = bytes.size();
 }
 
-void LSMTree::recover_wal() {
-  struct stat info {};
-  if (::fstat(wal_fd_, &info) != 0) {
-    system_error("fstat WAL");
+// Makes `next` the live set of tables by appending one edit record (tables
+// removed, tables added or moved to another level) and fsyncing it. The edit
+// is the commit point: before its fsync the old tables are live, after it the
+// new ones are.
+void LSMTree::commit(Levels next, bool flushed_memtable) {
+  std::map<std::uint64_t, std::size_t> before;
+  for (std::size_t level = 0; level < levels_.size(); ++level) {
+    for (const auto& table : levels_[level]) {
+      before[table->generation] = level;
+    }
   }
-  const std::uint64_t file_size = static_cast<std::uint64_t>(info.st_size);
-  std::uint64_t offset = 0;
-  while (offset < file_size) {
-    if (file_size - offset < kWalHeader) {
-      break;
+  std::map<std::uint64_t, std::size_t> after;
+  for (std::size_t level = 0; level < next.size(); ++level) {
+    for (const auto& table : next[level]) {
+      after[table->generation] = level;
     }
-    std::vector<std::uint8_t> header(kWalHeader);
-    if (!read_exact(wal_fd_, offset, header.data(), header.size())) {
-      break;
+  }
+  std::vector<std::uint8_t> removed;
+  std::uint32_t removed_count = 0;
+  for (const auto& [generation, level] : before) {
+    const auto found = after.find(generation);
+    if (found == after.end() || found->second != level) {
+      append_u64(removed, generation);
+      ++removed_count;
     }
-    const std::uint32_t magic = read_u32(header.data());
-    const std::uint64_t sequence = read_u64(header.data() + 4);
-    const std::uint8_t type = header[12];
-    const std::uint32_t key_length = read_u32(header.data() + 16);
-    const std::uint32_t value_length = read_u32(header.data() + 20);
-    const std::uint64_t record_size =
-        kWalHeader + static_cast<std::uint64_t>(key_length) +
-        static_cast<std::uint64_t>(value_length) + kChecksum;
-    if (magic != kWalMagic || sequence == 0 || (type != 1 && type != 2) ||
-        header[13] != 0 || header[14] != 0 || header[15] != 0 ||
-        key_length == 0 || key_length > kMaxKey || value_length > kMaxValue ||
-        (type == 2 && value_length != 0) ||
-        record_size > file_size - offset ||
-        record_size > std::numeric_limits<std::size_t>::max()) {
-      break;
-    }
-    std::vector<std::uint8_t> record(static_cast<std::size_t>(record_size));
-    if (!read_exact(wal_fd_, offset, record.data(), record.size())) {
-      break;
-    }
-    const std::uint32_t stored =
-        read_u32(record.data() + record.size() - kChecksum);
-    if (crc32(record.data(), record.size() - kChecksum) != stored) {
-      break;
-    }
-    const char* payload =
-        reinterpret_cast<const char*>(record.data() + kWalHeader);
-    std::string key(payload, key_length);
-    std::string value(payload + key_length, value_length);
-    const Entry entry{sequence, type == 2, std::move(value)};
-    const auto current = memtable_.find(key);
-    if (current == memtable_.end() ||
-        current->second.sequence <= entry.sequence) {
-      if (current != memtable_.end()) {
-        memtable_size_ -= current->first.size() + current->second.value.size();
+  }
+  std::vector<std::uint8_t> added;
+  std::uint32_t added_count = 0;
+  for (std::size_t level = 0; level < next.size(); ++level) {
+    for (const auto& table : next[level]) {
+      const auto found = before.find(table->generation);
+      if (found == before.end() || found->second != level) {
+        append_manifest_entry(added, table->generation, level, table->smallest,
+                              table->largest);
+        ++added_count;
       }
-      memtable_size_ += key.size() + entry.value.size();
-      memtable_[std::move(key)] = entry;
-    }
-    sequence_ = std::max(sequence_, sequence);
-    offset += record_size;
-  }
-  if (offset != file_size) {
-    if (::ftruncate(wal_fd_, static_cast<off_t>(offset)) != 0 ||
-        ::fsync(wal_fd_) != 0) {
-      system_error("repair WAL");
     }
   }
-  wal_size_ = offset;
+  std::vector<std::uint8_t> payload;
+  append_u64(payload, next_generation_);
+  append_u32(payload, removed_count);
+  payload.insert(payload.end(), removed.begin(), removed.end());
+  append_u32(payload, added_count);
+  payload.insert(payload.end(), added.begin(), added.end());
+  const auto record = manifest_record(kManifestEdit, payload);
+
+  try {
+    write_all(manifest_fd_, record.data(), record.size());
+  } catch (...) {
+    // As with the WAL: a partial record must not stay in the log, or every
+    // later edit would sit behind an unreadable one.
+    if (::ftruncate(manifest_fd_, static_cast<off_t>(manifest_bytes_)) != 0) {
+      failed_ = true;
+    }
+    throw;
+  }
+  if (::fsync(manifest_fd_) != 0) {
+    failed_ = true;
+    system_error("fsync MANIFEST");
+  }
+  manifest_bytes_ += record.size();
+  levels_ = std::move(next);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    published_ = std::make_shared<const Levels>(levels_);
+    if (flushed_memtable) {
+      immutable_.reset();
+      immutable_wals_.clear();
+    }
+  }
+
+  if (manifest_bytes_ >= kManifestRewriteBytes &&
+      manifest_bytes_ > 4 * manifest_snapshot_bytes_) {
+    try {
+      rewrite_manifest();
+    } catch (...) {
+      // The edit above is already committed. A rewrite that failed before
+      // its rename left the complete old log in place, so carry on.
+      if (failed_) {
+        throw;
+      }
+    }
+  }
+}
+
+// Each memtable has its own WAL file, wal-N.log, so flushing a memtable can
+// delete exactly the logs that hold its data. A legacy active.wal is log 0.
+std::filesystem::path LSMTree::wal_path(std::uint64_t number) const {
+  return number == 0 ? directory_ / "active.wal"
+                     : directory_ / ("wal-" + std::to_string(number) + ".log");
+}
+
+// Replays every WAL in log order into the memtable, then starts a new log
+// for new writes. The replayed logs stay until that memtable is flushed.
+void LSMTree::open_wals() {
+  std::vector<std::uint64_t> numbers;
+  for (const auto& item : std::filesystem::directory_iterator(directory_)) {
+    if (!item.is_regular_file()) {
+      continue;
+    }
+    const std::string name = item.path().filename().string();
+    if (name == "active.wal") {
+      numbers.push_back(0);
+      continue;
+    }
+    if (name.size() > 8 && name.rfind("wal-", 0) == 0 &&
+        name.compare(name.size() - 4, 4, ".log") == 0) {
+      const std::string digits = name.substr(4, name.size() - 8);
+      if (std::all_of(digits.begin(), digits.end(), [](unsigned char c) {
+            return std::isdigit(c) != 0;
+          }) &&
+          digits.size() <= 19) {
+        numbers.push_back(std::stoull(digits));
+      }
+    }
+  }
+  std::sort(numbers.begin(), numbers.end());
+  for (const std::uint64_t number : numbers) {
+    recover_wal(wal_path(number));
+    memtable_wals_.push_back(number);
+    wal_number_ = std::max(wal_number_, number);
+  }
+  rotate_wal();
+}
+
+// Starts a new WAL file and makes its name durable before any write in it
+// can be acknowledged. Called by the constructor, or by a writer holding
+// write_mutex_ and mutex_.
+void LSMTree::rotate_wal() {
+  const std::uint64_t number = wal_number_ + 1;
+  const auto path = wal_path(number);
+  const int fd =
+      ::open(path.c_str(), O_CREAT | O_RDWR | O_APPEND | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    system_error("create WAL");
+  }
+  try {
+    sync_directory();
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
+  if (wal_fd_ >= 0) {
+    ::close(wal_fd_);
+  }
+  wal_fd_ = fd;
+  wal_size_ = 0;
+  wal_number_ = number;
+  memtable_wals_.push_back(number);
+}
+
+// Replays the verified prefix of one WAL file into the memtable and
+// truncates anything after it (a torn tail).
+void LSMTree::recover_wal(const std::filesystem::path& path) {
+  const int fd = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+  if (fd < 0) {
+    system_error("open WAL");
+  }
+  try {
+    struct stat info {};
+    if (::fstat(fd, &info) != 0) {
+      system_error("fstat WAL");
+    }
+    const std::uint64_t file_size = static_cast<std::uint64_t>(info.st_size);
+    std::uint64_t offset = 0;
+    while (offset < file_size) {
+      if (file_size - offset < kWalHeader) {
+        break;
+      }
+      std::vector<std::uint8_t> header(kWalHeader);
+      if (!read_exact(fd, offset, header.data(), header.size())) {
+        break;
+      }
+      const std::uint32_t magic = read_u32(header.data());
+      const std::uint64_t sequence = read_u64(header.data() + 4);
+      const std::uint8_t type = header[12];
+      const std::uint32_t key_length = read_u32(header.data() + 16);
+      const std::uint32_t value_length = read_u32(header.data() + 20);
+      const std::uint64_t record_size =
+          kWalHeader + static_cast<std::uint64_t>(key_length) +
+          static_cast<std::uint64_t>(value_length) + kChecksum;
+      if (magic != kWalMagic || sequence == 0 || (type != 1 && type != 2) ||
+          header[13] != 0 || header[14] != 0 || header[15] != 0 ||
+          key_length == 0 || key_length > kMaxKey || value_length > kMaxValue ||
+          (type == 2 && value_length != 0) ||
+          record_size > file_size - offset ||
+          record_size > std::numeric_limits<std::size_t>::max()) {
+        break;
+      }
+      std::vector<std::uint8_t> record(static_cast<std::size_t>(record_size));
+      if (!read_exact(fd, offset, record.data(), record.size())) {
+        break;
+      }
+      const std::uint32_t stored =
+          read_u32(record.data() + record.size() - kChecksum);
+      if (crc32(record.data(), record.size() - kChecksum) != stored) {
+        break;
+      }
+      const char* payload =
+          reinterpret_cast<const char*>(record.data() + kWalHeader);
+      std::string key(payload, key_length);
+      std::string value(payload + key_length, value_length);
+      insert_memtable(key, Entry{sequence, type == 2, std::move(value)});
+      sequence_ = std::max(sequence_, sequence);
+      offset += record_size;
+    }
+    if (offset != file_size) {
+      if (::ftruncate(fd, static_cast<off_t>(offset)) != 0 ||
+          ::fsync(fd) != 0) {
+        system_error("repair WAL");
+      }
+    }
+  } catch (...) {
+    ::close(fd);
+    throw;
+  }
+  ::close(fd);
 }
 
 void LSMTree::put(const std::string& key, const std::string& value) {
@@ -1215,7 +1888,11 @@ void LSMTree::mutate(const std::string& key, const std::string& value,
   if (key.empty() || key.size() > kMaxKey || value.size() > kMaxValue) {
     throw std::invalid_argument("invalid key or value length");
   }
+  // Writers take turns; readers are never blocked by a writer's fsync.
+  std::lock_guard<std::mutex> writer(write_mutex_);
   require_writable();
+  make_room();
+  // Only writers change sequence_, and this one holds write_mutex_.
   const std::uint64_t sequence = sequence_ + 1;
   std::vector<std::uint8_t> record;
   record.reserve(kWalHeader + key.size() + value.size() + kChecksum);
@@ -1246,30 +1923,124 @@ void LSMTree::mutate(const std::string& key, const std::string& value,
     system_error("fsync WAL");
   }
   wal_size_ += record.size();
-  sequence_ = sequence;
 
-  const auto current = memtable_.find(key);
-  if (current != memtable_.end()) {
-    memtable_size_ -= current->first.size() + current->second.value.size();
+  std::lock_guard<std::mutex> lock(mutex_);
+  sequence_ = sequence;
+  insert_memtable(key, Entry{sequence, tombstone, value});
+}
+
+// With write_mutex_ held: if the memtable is full, hands it to the
+// background thread, first waiting for the previous one to be flushed.
+void LSMTree::make_room() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (memtable_size_ < options_.memtable_bytes) {
+    return;
   }
-  memtable_[key] = {sequence, tombstone, value};
-  memtable_size_ += key.size() + value.size();
-  if (memtable_size_ >= options_.memtable_bytes) {
-    flush();
+  done_cv_.wait(lock, [&] {
+    return immutable_ == nullptr || background_error_ != nullptr;
+  });
+  rethrow_background_error();
+  switch_memtable();
+}
+
+// With write_mutex_ and mutex_ held: freezes the memtable for the background
+// thread and starts a new memtable with its own WAL.
+void LSMTree::switch_memtable() {
+  std::vector<std::uint64_t> frozen_wals = memtable_wals_;
+  memtable_wals_.clear();
+  try {
+    rotate_wal();
+  } catch (...) {
+    memtable_wals_ = std::move(frozen_wals);
+    throw;
+  }
+  immutable_ = std::make_shared<const Memtable>(std::move(memtable_));
+  immutable_wals_ = std::move(frozen_wals);
+  memtable_ = Memtable();
+  memtable_size_ = 0;
+  work_cv_.notify_one();
+}
+
+// With mutex_ held.
+void LSMTree::rethrow_background_error() const {
+  if (background_error_ != nullptr) {
+    std::rethrow_exception(background_error_);
   }
 }
 
+// Adds one version to the memtable. Without live snapshots only the newest
+// version of a key is ever readable, so older ones are replaced in place;
+// while a snapshot exists they are kept, and flush decides which survive.
+void LSMTree::insert_memtable(const std::string& key, Entry entry) {
+  const auto newest =
+      memtable_.lower_bound({key, std::numeric_limits<std::uint64_t>::max()});
+  const bool has_versions = newest != memtable_.end() && newest->first.first == key;
+  if (has_versions && newest->first.second >= entry.sequence) {
+    return;  // Already have this version or a newer one (WAL replay).
+  }
+  if (has_versions && !snapshots_->any()) {
+    auto version = newest;
+    while (version != memtable_.end() && version->first.first == key) {
+      memtable_size_ -= key.size() + version->second.value.size();
+      version = memtable_.erase(version);
+    }
+  }
+  memtable_size_ += key.size() + entry.value.size();
+  const std::uint64_t sequence = entry.sequence;
+  memtable_.emplace(std::make_pair(key, sequence), std::move(entry));
+}
+
+std::shared_ptr<const Snapshot> LSMTree::snapshot() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return std::shared_ptr<const Snapshot>(new Snapshot(sequence_, snapshots_));
+}
+
+std::uint64_t LSMTree::smallest_snapshot() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return snapshots_->smallest(sequence_);
+}
+
 std::optional<std::string> LSMTree::get(const std::string& key) const {
-  const auto memory = memtable_.find(key);
-  if (memory != memtable_.end()) {
-    return memory->second.tombstone
-               ? std::nullopt
-               : std::optional<std::string>(memory->second.value);
+  return read(key, std::numeric_limits<std::uint64_t>::max());
+}
+
+std::optional<std::string> LSMTree::get(const std::string& key,
+                                        const Snapshot& snapshot) const {
+  return read(key, snapshot.sequence());
+}
+
+// Returns the newest version of `key` with a sequence no greater than `at`.
+// Only the in-memory table is searched under the lock; the frozen memtable
+// and the tables are pinned and searched without it.
+std::optional<std::string> LSMTree::read(const std::string& key,
+                                         std::uint64_t at) const {
+  std::shared_ptr<const Memtable> frozen;
+  std::shared_ptr<const Levels> version;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Versions of a key sort newest first, so this finds the newest visible.
+    const auto memory = memtable_.lower_bound({key, at});
+    if (memory != memtable_.end() && memory->first.first == key) {
+      return memory->second.tombstone
+                 ? std::nullopt
+                 : std::optional<std::string>(memory->second.value);
+    }
+    frozen = immutable_;
+    version = published_;
+  }
+  if (frozen != nullptr) {
+    const auto memory = frozen->lower_bound({key, at});
+    if (memory != frozen->end() && memory->first.first == key) {
+      return memory->second.tombstone
+                 ? std::nullopt
+                 : std::optional<std::string>(memory->second.value);
+    }
   }
   // Shallower levels hold newer data, and within level 0 newer tables come
-  // first, so the first table that contains the key has its newest version.
-  for (std::size_t level = 0; level < levels_.size(); ++level) {
-    const auto& tables = levels_[level];
+  // first, so the first table with a visible version has the newest one.
+  const Levels& levels = *version;
+  for (std::size_t level = 0; level < levels.size(); ++level) {
+    const auto& tables = levels[level];
     std::size_t first = 0;
     std::size_t last = tables.size();
     if (level > 0) {
@@ -1287,13 +2058,18 @@ std::optional<std::string> LSMTree::get(const std::string& key) const {
     }
     for (std::size_t index = first; index < last; ++index) {
       const Table& table = *tables[index];
-      ++bloom_checks_;
+      bloom_checks_.add();
       if (!table.bloom.maybe_contains(key)) {
-        ++bloom_negative_hits_;
+        bloom_negative_hits_.add();
         continue;
       }
       TableCursor cursor(table, block_cache_.get(), block_reads_);
       cursor.seek(key);
+      // Step past versions newer than the reader may see.
+      while (cursor.valid() && cursor.key() == key &&
+             cursor.entry().sequence > at) {
+        cursor.next();
+      }
       if (cursor.valid() && cursor.key() == key) {
         return cursor.entry().tombstone
                    ? std::nullopt
@@ -1306,11 +2082,57 @@ std::optional<std::string> LSMTree::get(const std::string& key) const {
 
 std::vector<std::pair<std::string, std::string>> LSMTree::scan(
     const std::string& begin, const std::string& end) const {
+  return scan_at(begin, end, std::numeric_limits<std::uint64_t>::max());
+}
+
+std::vector<std::pair<std::string, std::string>> LSMTree::scan(
+    const std::string& begin, const std::string& end,
+    const Snapshot& snapshot) const {
+  return scan_at(begin, end, snapshot.sequence());
+}
+
+std::vector<std::pair<std::string, std::string>> LSMTree::scan_at(
+    const std::string& begin, const std::string& end, std::uint64_t at) const {
   if (end < begin) {
     throw std::invalid_argument("scan end precedes begin");
   }
+  // For each key, the version with the highest sequence not above `at`.
   std::map<std::string, Entry> latest;
-  for (const auto& tables : levels_) {
+  const auto offer = [&](const std::string& key, const Entry& entry) {
+    if (entry.sequence > at) {
+      return;
+    }
+    const auto current = latest.find(key);
+    if (current == latest.end() || current->second.sequence < entry.sequence) {
+      latest[key] = entry;
+    }
+  };
+  const auto offer_memtable = [&](const Memtable& memtable) {
+    for (auto iterator = memtable.lower_bound(
+             {begin, std::numeric_limits<std::uint64_t>::max()});
+         iterator != memtable.end() &&
+         (end.empty() || iterator->first.first < end);
+         ++iterator) {
+      offer(iterator->first.first, iterator->second);
+    }
+  };
+  std::shared_ptr<const Memtable> frozen;
+  std::shared_ptr<const Levels> version;
+  {
+    // One consistent cut: the live memtable is read, and the frozen
+    // memtable and tables pinned, under the same lock.
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (at == std::numeric_limits<std::uint64_t>::max()) {
+      at = sequence_;
+    }
+    offer_memtable(memtable_);
+    frozen = immutable_;
+    version = published_;
+  }
+  if (frozen != nullptr) {
+    offer_memtable(*frozen);
+  }
+  for (const auto& tables : *version) {
     for (const auto& table : tables) {
       if (table->entry_count == 0 || table->largest < begin ||
           (!end.empty() && !(table->smallest < end))) {
@@ -1320,22 +2142,8 @@ std::vector<std::pair<std::string, std::string>> LSMTree::scan(
       for (cursor.seek(begin);
            cursor.valid() && (end.empty() || cursor.key() < end);
            cursor.next()) {
-        const auto current = latest.find(cursor.key());
-        if (current == latest.end() ||
-            current->second.sequence < cursor.entry().sequence) {
-          latest[cursor.key()] = cursor.entry();
-        }
+        offer(cursor.key(), cursor.entry());
       }
-    }
-  }
-  for (auto iterator = memtable_.lower_bound(begin);
-       iterator != memtable_.end() &&
-       (end.empty() || iterator->first < end);
-       ++iterator) {
-    const auto current = latest.find(iterator->first);
-    if (current == latest.end() ||
-        current->second.sequence < iterator->second.sequence) {
-      latest[iterator->first] = iterator->second;
     }
   }
   std::vector<std::pair<std::string, std::string>> output;
@@ -1354,38 +2162,147 @@ std::filesystem::path LSMTree::table_path(std::uint64_t generation,
                        (temporary ? ".dat.tmp" : ".dat"));
 }
 
+// Makes everything written so far part of a table: freezes the memtable and
+// waits for the background thread to flush it.
 void LSMTree::flush() {
+  std::lock_guard<std::mutex> writer(write_mutex_);
+  std::unique_lock<std::mutex> lock(mutex_);
+  const auto flushed = [&] {
+    return immutable_ == nullptr || background_error_ != nullptr;
+  };
+  done_cv_.wait(lock, flushed);
+  rethrow_background_error();
   if (memtable_.empty()) {
     return;
   }
   require_writable();
-  const std::uint64_t generation = next_generation_++;
-  const auto temporary = table_path(generation, true);
-  const auto destination = table_path(generation, false);
-  build_table(temporary, options_, memtable_.size(), [&](TableWriter& writer) {
-    for (const auto& [key, entry] : memtable_) {
-      writer.add(key, entry);
-    }
-  });
-  if (::rename(temporary.c_str(), destination.c_str()) != 0) {
-    system_error("rename SSTable");
-  }
-  sync_directory();
-  auto table = load_table(destination);
-  table->smallest = memtable_.begin()->first;
-  Levels next = levels_;
-  next[0].insert(next[0].begin(), std::move(table));
-  // The table is live once the MANIFEST lists it; only then may the WAL that
-  // also holds its data be discarded.
-  write_manifest(next);
-  levels_ = std::move(next);
-  reset_wal();
-  memtable_.clear();
-  memtable_size_ = 0;
-  maybe_compact();
+  switch_memtable();
+  done_cv_.wait(lock, flushed);
+  rethrow_background_error();
 }
 
+// Merges every table into the deepest level, on the background thread.
 void LSMTree::compact() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  rethrow_background_error();
+  require_writable();
+  manual_compaction_ = true;
+  work_cv_.notify_one();
+  done_cv_.wait(lock, [&] {
+    return !manual_compaction_ || background_error_ != nullptr;
+  });
+  rethrow_background_error();
+}
+
+void LSMTree::wait_for_compactions() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  done_cv_.wait(lock, [&] {
+    return background_error_ != nullptr ||
+           (!busy_ && immutable_ == nullptr && !manual_compaction_ &&
+            !needs_compaction(*published_));
+  });
+  rethrow_background_error();
+}
+
+// The only thread that flushes, compacts or commits to the MANIFEST, so
+// levels_ and the MANIFEST state are touched by it alone once open.
+void LSMTree::background_loop() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  for (;;) {
+    work_cv_.wait(lock, [&] {
+      return stopping_ ||
+             (background_error_ == nullptr &&
+              (immutable_ != nullptr || manual_compaction_ ||
+               needs_compaction(*published_)));
+    });
+    if (stopping_) {
+      return;
+    }
+    busy_ = true;
+    const bool flush_pending = immutable_ != nullptr;
+    const bool manual = manual_compaction_;
+    lock.unlock();
+    try {
+      if (flush_pending) {
+        flush_immutable();
+      } else if (manual) {
+        compact_everything();
+      } else {
+        compaction_step();
+      }
+      lock.lock();
+      if (!flush_pending && manual) {
+        manual_compaction_ = false;
+      }
+    } catch (...) {
+      lock.lock();
+      // Recorded once and rethrown to every waiter; writes are refused
+      // until the database is reopened.
+      background_error_ = std::current_exception();
+      failed_ = true;
+    }
+    busy_ = false;
+    done_cv_.notify_all();
+  }
+}
+
+// Writes the frozen memtable as a level 0 table, commits it, and deletes
+// the WAL files that held its data.
+void LSMTree::flush_immutable() {
+  std::shared_ptr<const Memtable> memtable;
+  std::vector<std::uint64_t> wals;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    memtable = immutable_;
+    wals = immutable_wals_;
+  }
+  const std::uint64_t oldest_reader = smallest_snapshot();
+  if (memtable->empty()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    immutable_.reset();
+    immutable_wals_.clear();
+  } else {
+    const std::uint64_t generation = next_generation_++;
+    const auto temporary = table_path(generation, true);
+    const auto destination = table_path(generation, false);
+    build_table(temporary, options_, memtable->size(), [&](TableWriter& writer) {
+      const std::string* current = nullptr;
+      std::uint64_t newer = 0;
+      for (const auto& [internal, entry] : *memtable) {
+        if (current == nullptr || internal.first != *current) {
+          current = &internal.first;
+          newer = std::numeric_limits<std::uint64_t>::max();
+        }
+        // A version whose newer version is visible to every reader is
+        // hidden from all of them.
+        const bool hidden = newer <= oldest_reader;
+        newer = internal.second;
+        if (!hidden) {
+          writer.add(internal.first, entry);
+        }
+      }
+    });
+    if (::rename(temporary.c_str(), destination.c_str()) != 0) {
+      system_error("rename SSTable");
+    }
+    sync_directory();
+    auto table = load_table(destination);
+    table->smallest = memtable->begin()->first.first;
+    Levels next = levels_;
+    next[0].insert(next[0].begin(), std::move(table));
+    // The table is live once the MANIFEST lists it; the commit also retires
+    // the frozen memtable, so readers never see both or neither.
+    commit(std::move(next), true);
+  }
+  // Only now may the logs holding the same data go.
+  for (const std::uint64_t number : wals) {
+    std::error_code ignored;
+    std::filesystem::remove(wal_path(number), ignored);
+  }
+  sync_directory();
+}
+
+void LSMTree::compact_everything() {
   std::vector<std::shared_ptr<Table>> inputs;
   std::size_t target = 1;
   for (std::size_t level = 0; level < levels_.size(); ++level) {
@@ -1399,9 +2316,8 @@ void LSMTree::compact() {
   if (inputs.size() < 2) {
     return;
   }
-  require_writable();
   // Everything is an input and nothing lies below the target, so every
-  // tombstone can be dropped.
+  // tombstone no snapshot needs can be dropped.
   run_compaction(inputs, target);
 }
 
@@ -1417,26 +2333,36 @@ std::uint64_t LSMTree::level_limit(std::size_t level) const {
   return limit;
 }
 
-void LSMTree::maybe_compact() {
-  for (;;) {
-    if (levels_[0].size() >= options_.compaction_trigger) {
-      compact_level0();
-      continue;
+bool LSMTree::needs_compaction(const Levels& levels) const {
+  if (levels[0].size() >= options_.compaction_trigger) {
+    return true;
+  }
+  // The last level has no size limit.
+  for (std::size_t level = 1; level + 1 < levels.size(); ++level) {
+    std::uint64_t bytes = 0;
+    for (const auto& table : levels[level]) {
+      bytes += table->file_bytes;
     }
-    bool compacted = false;
-    // The last level has no size limit.
-    for (std::size_t level = 1; level + 1 < levels_.size(); ++level) {
-      std::uint64_t bytes = 0;
-      for (const auto& table : levels_[level]) {
-        bytes += table->file_bytes;
-      }
-      if (bytes > level_limit(level)) {
-        compact_level(level);
-        compacted = true;
-        break;
-      }
+    if (bytes > level_limit(level)) {
+      return true;
     }
-    if (!compacted) {
+  }
+  return false;
+}
+
+// One unit of compaction work, chosen from the current levels.
+void LSMTree::compaction_step() {
+  if (levels_[0].size() >= options_.compaction_trigger) {
+    compact_level0();
+    return;
+  }
+  for (std::size_t level = 1; level + 1 < levels_.size(); ++level) {
+    std::uint64_t bytes = 0;
+    for (const auto& table : levels_[level]) {
+      bytes += table->file_bytes;
+    }
+    if (bytes > level_limit(level)) {
+      compact_level(level);
       return;
     }
   }
@@ -1506,9 +2432,7 @@ void LSMTree::compact_level(std::size_t level) {
                                return left->smallest < right->smallest;
                              }),
             table);
-  write_manifest(next);
-  levels_ = std::move(next);
-  table->level = level + 1;
+  commit(std::move(next));
 }
 
 // True when no level below `level` can hold a version of `key`, so a
@@ -1580,44 +2504,65 @@ void LSMTree::run_compaction(const std::vector<std::shared_ptr<Table>>& inputs,
       cursors.emplace_back(*table, nullptr, block_reads_);
       cursors.back().seek("");
     }
+    const std::uint64_t oldest_reader = smallest_snapshot();
+    std::string current_key;
+    bool have_key = false;
+    std::uint64_t newer = 0;  // Sequence of the previous version of the key.
     for (;;) {
-      const std::string* smallest = nullptr;
-      for (const auto& cursor : cursors) {
+      // The next entry in (key ascending, sequence descending) order.
+      TableCursor* next = nullptr;
+      for (auto& cursor : cursors) {
         if (cursor.valid() &&
-            (smallest == nullptr || cursor.key() < *smallest)) {
-          smallest = &cursor.key();
+            (next == nullptr || cursor.key() < next->key() ||
+             (cursor.key() == next->key() &&
+              cursor.entry().sequence > next->entry().sequence))) {
+          next = &cursor;
         }
       }
-      if (smallest == nullptr) {
+      if (next == nullptr) {
         break;
       }
-      const std::string key = *smallest;
-      const Entry* newest = nullptr;
-      for (const auto& cursor : cursors) {
-        if (cursor.valid() && cursor.key() == key &&
-            (newest == nullptr || cursor.entry().sequence > newest->sequence)) {
-          newest = &cursor.entry();
-        }
-      }
-      if (!(newest->tombstone && is_base_level(output_level, key))) {
-        if (!writer) {
-          const std::uint64_t generation = next_generation_++;
-          outputs.push_back({generation, table_path(generation, true), key, key});
-          writer = std::make_unique<TableWriter>(
-              outputs.back().temporary, options_.block_bytes,
-              options_.bloom_bits_per_key, keys_per_output);
-        }
-        writer->add(key, *newest);
-        outputs.back().largest = key;
-        if (writer->bytes_written() >= options_.table_bytes) {
-          finish_output();
-        }
-      }
+      const std::string key = next->key();
+      const Entry entry = next->entry();
+      // Advance every input at this exact version. Two inputs can hold the
+      // same version after a crash between a flush and its WAL reset.
       for (auto& cursor : cursors) {
-        if (cursor.valid() && cursor.key() == key) {
+        if (cursor.valid() && cursor.key() == key &&
+            cursor.entry().sequence == entry.sequence) {
           cursor.next();
         }
       }
+      if (!have_key || key != current_key) {
+        current_key = key;
+        have_key = true;
+        newer = std::numeric_limits<std::uint64_t>::max();
+      }
+      // Hidden: a newer version of the key is visible to every reader.
+      // Collectable tombstone: no reader predates it and nothing below the
+      // output level can hold an older version for it to hide.
+      const bool hidden = newer <= oldest_reader;
+      const bool collectable = entry.tombstone &&
+                               entry.sequence <= oldest_reader &&
+                               is_base_level(output_level, key);
+      newer = entry.sequence;
+      if (hidden || collectable) {
+        continue;
+      }
+      // Split outputs only between keys, so no two tables in a level share
+      // a key.
+      if (writer && key != outputs.back().largest &&
+          writer->bytes_written() >= options_.table_bytes) {
+        finish_output();
+      }
+      if (!writer) {
+        const std::uint64_t generation = next_generation_++;
+        outputs.push_back({generation, table_path(generation, true), key, key});
+        writer = std::make_unique<TableWriter>(
+            outputs.back().temporary, options_.block_bytes,
+            options_.bloom_bits_per_key, keys_per_output);
+      }
+      writer->add(key, entry);
+      outputs.back().largest = key;
     }
     if (writer) {
       finish_output();
@@ -1666,8 +2611,7 @@ void LSMTree::run_compaction(const std::vector<std::shared_ptr<Table>>& inputs,
   std::sort(level.begin(), level.end(), [](const auto& left, const auto& right) {
     return left->smallest < right->smallest;
   });
-  write_manifest(next);
-  levels_ = std::move(next);
+  commit(std::move(next));
 
   // The inputs are no longer live. A file that fails to delete is an orphan
   // and is removed on the next open.
@@ -1676,14 +2620,6 @@ void LSMTree::run_compaction(const std::vector<std::shared_ptr<Table>>& inputs,
     std::filesystem::remove(table->path, ignored);
   }
   sync_directory();
-}
-
-void LSMTree::reset_wal() {
-  if (::ftruncate(wal_fd_, 0) != 0 || ::fsync(wal_fd_) != 0) {
-    failed_ = true;
-    system_error("reset WAL");
-  }
-  wal_size_ = 0;
 }
 
 void LSMTree::require_writable() const {
@@ -1710,17 +2646,21 @@ void LSMTree::sync_directory() const {
 
 Stats LSMTree::stats() const {
   Stats stats;
-  stats.memtable_entries = memtable_.size();
-  stats.sequence = sequence_;
-  stats.bloom_checks = bloom_checks_;
-  stats.bloom_negative_hits = bloom_negative_hits_;
-  stats.block_reads = block_reads_;
-  stats.block_cache_hits = block_cache_->hits;
-  stats.compaction_bytes_written = compaction_bytes_written_;
-  for (const auto& tables : levels_) {
-    stats.tables_per_level.push_back(tables.size());
-    stats.sstable_count += tables.size();
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    stats.memtable_entries =
+        memtable_.size() + (immutable_ != nullptr ? immutable_->size() : 0);
+    stats.sequence = sequence_;
+    for (const auto& tables : *published_) {
+      stats.tables_per_level.push_back(tables.size());
+      stats.sstable_count += tables.size();
+    }
   }
+  stats.bloom_checks = bloom_checks_.load();
+  stats.bloom_negative_hits = bloom_negative_hits_.load();
+  stats.block_reads = block_reads_.load();
+  stats.block_cache_hits = block_cache_->hits.load();
+  stats.compaction_bytes_written = compaction_bytes_written_;
   return stats;
 }
 

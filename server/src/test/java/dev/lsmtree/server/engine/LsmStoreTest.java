@@ -145,4 +145,50 @@ class LsmStoreTest {
     }
     assertThat(Files.exists(directory.resolve("LOCK"))).isTrue();
   }
+
+  @Test
+  void readersRunAlongsideWriters() throws Exception {
+    LsmOptions small = new LsmOptions(4096, 10, 3, false);
+    try (LsmStore store = LsmStore.open(library(), directory, small);
+        ExecutorService pool = Executors.newFixedThreadPool(6)) {
+      java.util.concurrent.atomic.AtomicInteger written =
+          new java.util.concurrent.atomic.AtomicInteger();
+      java.util.concurrent.atomic.AtomicBoolean done =
+          new java.util.concurrent.atomic.AtomicBoolean();
+      java.util.concurrent.atomic.AtomicInteger wrong =
+          new java.util.concurrent.atomic.AtomicInteger();
+      Future<?> writer = pool.submit(() -> {
+        for (int index = 0; index < 3000; index++) {
+          store.put(b(String.format("key-%05d", index)), b("value-" + index));
+          written.set(index + 1);
+        }
+        done.set(true);
+      });
+      List<Future<?>> readers = new ArrayList<>();
+      for (int reader = 0; reader < 4; reader++) {
+        readers.add(pool.submit(() -> {
+          java.util.Random random = new java.util.Random();
+          while (!done.get()) {
+            int available = written.get();
+            if (available == 0) {
+              continue;
+            }
+            // Every write that put() returned for must be readable.
+            int index = random.nextInt(available);
+            if (!store.get(b(String.format("key-%05d", index)))
+                .map(LsmStoreTest::s)
+                .equals(java.util.Optional.of("value-" + index))) {
+              wrong.incrementAndGet();
+            }
+          }
+        }));
+      }
+      writer.get();
+      for (Future<?> reader : readers) {
+        reader.get();
+      }
+      assertThat(wrong.get()).isZero();
+      assertThat(store.scan(b(""), b(""))).hasSize(3000);
+    }
+  }
 }

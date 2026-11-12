@@ -1,10 +1,15 @@
 #pragma once
 
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <thread>
 #include <optional>
 #include <string>
 #include <vector>
@@ -47,6 +52,69 @@ struct Stats {
   std::vector<std::size_t> tables_per_level;
 };
 
+class LSMTree;
+
+namespace detail {
+
+// A statistics counter that many threads can bump without contending:
+// each thread adds to its own cache-line-sized slot, and reading sums them.
+class ShardedCounter {
+ public:
+  void add(std::uint64_t amount = 1) noexcept {
+    slots_[slot()].value.fetch_add(amount, std::memory_order_relaxed);
+  }
+
+  std::uint64_t load() const noexcept {
+    std::uint64_t total = 0;
+    for (const auto& slot : slots_) {
+      total += slot.value.load(std::memory_order_relaxed);
+    }
+    return total;
+  }
+
+ private:
+  static constexpr std::size_t kSlots = 16;
+  struct alignas(64) Slot {
+    std::atomic<std::uint64_t> value{0};
+  };
+
+  static std::size_t slot() noexcept {
+    static std::atomic<std::size_t> next{0};
+    thread_local const std::size_t index =
+        next.fetch_add(1, std::memory_order_relaxed) % kSlots;
+    return index;
+  }
+
+  Slot slots_[kSlots];
+};
+
+}  // namespace detail
+
+// A consistent point-in-time view. Reads through a snapshot see exactly the
+// writes acknowledged before it was taken, however much is written,
+// flushed or compacted afterwards. Versions it can see are kept until it is
+// released (destroyed).
+class Snapshot {
+ public:
+  Snapshot(const Snapshot&) = delete;
+  Snapshot& operator=(const Snapshot&) = delete;
+  ~Snapshot();
+
+  // Sequence number of the last write the snapshot sees.
+  std::uint64_t sequence() const { return sequence_; }
+
+ private:
+  friend class LSMTree;
+  struct Registry;
+  Snapshot(std::uint64_t sequence, std::shared_ptr<Registry> registry);
+
+  std::uint64_t sequence_;
+  std::shared_ptr<Registry> registry_;
+};
+
+// Every public member is safe to call from any number of threads at once.
+// Reads run in parallel with each other and with writes; writes are applied
+// one at a time. Flushes and compactions run on a background thread.
 class LSMTree {
  public:
   struct Entry;
@@ -66,8 +134,19 @@ class LSMTree {
   std::vector<std::pair<std::string, std::string>> scan(
       const std::string& begin, const std::string& end) const;
 
+  std::shared_ptr<const Snapshot> snapshot() const;
+  std::optional<std::string> get(const std::string& key,
+                                 const Snapshot& snapshot) const;
+  std::vector<std::pair<std::string, std::string>> scan(
+      const std::string& begin, const std::string& end,
+      const Snapshot& snapshot) const;
+
+  // Writes the memtable to a table and waits until it is committed.
   void flush();
+  // Merges every table into the deepest level and waits for it.
   void compact();
+  // Waits until no flush or compaction is pending or running.
+  void wait_for_compactions();
   Stats stats() const;
 
  private:
@@ -75,48 +154,102 @@ class LSMTree {
   // tables with disjoint key ranges, sorted by smallest key.
   using Levels = std::vector<std::vector<std::shared_ptr<Table>>>;
 
+  // Memtable keys are (key, sequence), ordered by key and then newest first.
+  struct VersionOrder {
+    bool operator()(const std::pair<std::string, std::uint64_t>& left,
+                    const std::pair<std::string, std::uint64_t>& right) const {
+      return left.first < right.first ||
+             (left.first == right.first && left.second > right.second);
+    }
+  };
+
+  using Memtable = std::map<std::pair<std::string, std::uint64_t>, Entry,
+                           VersionOrder>;
+
   void mutate(const std::string& key, const std::string& value,
               bool tombstone);
+  void make_room();
+  void switch_memtable();
+  void rethrow_background_error() const;
+  void insert_memtable(const std::string& key, Entry entry);
+  std::optional<std::string> read(const std::string& key,
+                                  std::uint64_t at) const;
+  std::vector<std::pair<std::string, std::string>> scan_at(
+      const std::string& begin, const std::string& end,
+      std::uint64_t at) const;
+  std::uint64_t smallest_snapshot() const;
   void acquire_lock();
   void open_tables();
-  void write_manifest(const Levels& levels);
-  void recover_wal();
+  void commit(Levels next, bool flushed_memtable = false);
+  void rewrite_manifest();
+  std::filesystem::path wal_path(std::uint64_t number) const;
+  void open_wals();
+  void rotate_wal();
+  void recover_wal(const std::filesystem::path& path);
+  void background_loop();
+  void flush_immutable();
+  void compact_everything();
+  void compaction_step();
+  bool needs_compaction(const Levels& levels) const;
   std::filesystem::path table_path(std::uint64_t generation,
                                    bool temporary) const;
-  void maybe_compact();
   void compact_level0();
   void compact_level(std::size_t level);
   void run_compaction(const std::vector<std::shared_ptr<Table>>& inputs,
                       std::size_t output_level);
   bool is_base_level(std::size_t level, const std::string& key) const;
   std::uint64_t level_limit(std::size_t level) const;
-  void reset_wal();
   void sync_directory() const;
   void require_writable() const;
 
   std::filesystem::path directory_;
-  std::filesystem::path wal_path_;
   Options options_;
   int wal_fd_ = -1;
   // Holds an exclusive flock on <directory>/LOCK for the object's lifetime.
   int lock_fd_ = -1;
+  // Append-only MANIFEST log: open for appending edits, its size, and the
+  // size of the snapshot it starts with (to decide when to rewrite it).
+  int manifest_fd_ = -1;
+  std::uint64_t manifest_bytes_ = 0;
+  std::uint64_t manifest_snapshot_bytes_ = 0;
   // Byte length of the WAL up to the end of its last complete record.
   std::uint64_t wal_size_ = 0;
   // Set when an I/O error leaves the on-disk state uncertain; all further
   // mutations are refused until the database is reopened.
-  bool failed_ = false;
+  std::atomic<bool> failed_{false};
   std::uint64_t sequence_ = 0;
   std::uint64_t next_generation_ = 1;
   std::size_t memtable_size_ = 0;
-  std::map<std::string, Entry> memtable_;
+  Memtable memtable_;
+  std::shared_ptr<Snapshot::Registry> snapshots_;
   Levels levels_;
   // Per level, the largest key of the last table compacted from it, so that
   // successive compactions walk the key space round-robin.
   std::vector<std::string> compact_pointer_;
-  std::uint64_t compaction_bytes_written_ = 0;
-  mutable std::uint64_t bloom_checks_ = 0;
-  mutable std::uint64_t bloom_negative_hits_ = 0;
-  mutable std::uint64_t block_reads_ = 0;
+  std::atomic<std::uint64_t> compaction_bytes_written_{0};
+
+  // Concurrency. mutex_ guards memtable_, memtable_size_, immutable_,
+  // immutable_wals_, published_, sequence_ and the background-work flags.
+  // write_mutex_ orders writers and guards the WAL. levels_ and the MANIFEST
+  // state belong to the background thread once the database is open;
+  // readers use the published_ copy.
+  mutable std::mutex mutex_;
+  std::mutex write_mutex_;
+  std::condition_variable work_cv_;
+  std::condition_variable done_cv_;
+  std::shared_ptr<const Memtable> immutable_;
+  std::vector<std::uint64_t> immutable_wals_;
+  std::vector<std::uint64_t> memtable_wals_;
+  std::uint64_t wal_number_ = 0;
+  std::shared_ptr<const Levels> published_;
+  bool stopping_ = false;
+  bool busy_ = false;
+  bool manual_compaction_ = false;
+  std::exception_ptr background_error_;
+  std::thread worker_;
+  mutable detail::ShardedCounter bloom_checks_;
+  mutable detail::ShardedCounter bloom_negative_hits_;
+  mutable detail::ShardedCounter block_reads_;
   mutable std::unique_ptr<BlockCache> block_cache_;
 };
 
