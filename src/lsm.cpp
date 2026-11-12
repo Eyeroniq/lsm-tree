@@ -309,50 +309,68 @@ struct RawBlock {
 // LRU cache of checksum-verified data blocks, keyed by
 // (table generation, block index). Generations are never reused while the
 // database is open, so a cached block can never go stale; blocks of tables
-// removed by compaction simply age out.
+// removed by compaction simply age out. Split into independently locked
+// shards so concurrent readers rarely touch the same lock or LRU list.
 struct LSMTree::BlockCache {
   using Key = std::pair<std::uint64_t, std::size_t>;
-  struct Slot {
-    Key key;
-    std::shared_ptr<const RawBlock> block;
-    std::size_t charge;
-  };
+  static constexpr std::size_t kShards = 16;
 
-  explicit BlockCache(std::size_t capacity_bytes) : capacity(capacity_bytes) {}
+  explicit BlockCache(std::size_t capacity_bytes) {
+    for (auto& shard : shards) {
+      shard.capacity = capacity_bytes / kShards;
+    }
+  }
 
   std::shared_ptr<const RawBlock> find(const Key& key) {
-    std::lock_guard<std::mutex> guard(mutex);
-    const auto found = slots.find(key);
-    if (found == slots.end()) {
+    Shard& shard = shard_for(key);
+    std::lock_guard<std::mutex> guard(shard.mutex);
+    const auto found = shard.slots.find(key);
+    if (found == shard.slots.end()) {
       return nullptr;
     }
-    lru.splice(lru.begin(), lru, found->second);
-    ++hits;
+    shard.lru.splice(shard.lru.begin(), shard.lru, found->second);
+    hits.add();
     return found->second->block;
   }
 
   void insert(const Key& key, std::shared_ptr<const RawBlock> block,
               std::size_t charge) {
-    std::lock_guard<std::mutex> guard(mutex);
-    if (charge > capacity || slots.count(key) != 0) {
+    Shard& shard = shard_for(key);
+    std::lock_guard<std::mutex> guard(shard.mutex);
+    if (charge > shard.capacity || shard.slots.count(key) != 0) {
       return;
     }
-    lru.push_front({key, std::move(block), charge});
-    slots[key] = lru.begin();
-    used += charge;
-    while (used > capacity) {
-      used -= lru.back().charge;
-      slots.erase(lru.back().key);
-      lru.pop_back();
+    shard.lru.push_front({key, std::move(block), charge});
+    shard.slots[key] = shard.lru.begin();
+    shard.used += charge;
+    while (shard.used > shard.capacity) {
+      shard.used -= shard.lru.back().charge;
+      shard.slots.erase(shard.lru.back().key);
+      shard.lru.pop_back();
     }
   }
 
-  std::mutex mutex;
-  std::size_t capacity;
-  std::size_t used = 0;
-  std::atomic<std::uint64_t> hits{0};
-  std::list<Slot> lru;  // Most recently used first.
-  std::map<Key, std::list<Slot>::iterator> slots;
+  struct Slot {
+    Key key;
+    std::shared_ptr<const RawBlock> block;
+    std::size_t charge;
+  };
+  struct alignas(64) Shard {
+    std::mutex mutex;
+    std::size_t capacity = 0;
+    std::size_t used = 0;
+    std::list<Slot> lru;  // Most recently used first.
+    std::map<Key, std::list<Slot>::iterator> slots;
+  };
+
+  Shard& shard_for(const Key& key) {
+    const std::uint64_t mixed =
+        (key.first * 0x9E3779B97F4A7C15ULL) ^ (key.second * 0xC2B2AE3D27D4EB4FULL);
+    return shards[(mixed >> 32) % kShards];
+  }
+
+  Shard shards[kShards];
+  detail::ShardedCounter hits;
 };
 
 namespace {
@@ -878,7 +896,7 @@ std::shared_ptr<const RawBlock> read_block(const Table& table,
 class TableCursor {
  public:
   TableCursor(const Table& table, LSMTree::BlockCache* cache,
-              std::atomic<std::uint64_t>& block_reads)
+              detail::ShardedCounter& block_reads)
       : table_(table), cache_(cache), block_reads_(block_reads) {}
 
   // Positions at the first entry whose key is >= target.
@@ -955,7 +973,7 @@ class TableCursor {
     }
     if (block == nullptr) {
       block = read_block(table_, block_);
-      ++block_reads_;
+      block_reads_.add();
       if (cache_ != nullptr) {
         cache_->insert(key, block, block->bytes.size() + 64);
       }
@@ -965,7 +983,7 @@ class TableCursor {
 
   const Table& table_;
   LSMTree::BlockCache* cache_;
-  std::atomic<std::uint64_t>& block_reads_;
+  detail::ShardedCounter& block_reads_;
   std::size_t block_ = 0;
   std::size_t position_ = 0;
   BlockIterator iterator_;
@@ -1338,7 +1356,7 @@ std::optional<Manifest> read_manifest(const std::filesystem::path& path) {
 
 // Smallest key of a table, reading its first block if necessary.
 std::string first_key(const Table& table) {
-  std::atomic<std::uint64_t> ignored{0};
+  detail::ShardedCounter ignored;
   TableCursor cursor(table, nullptr, ignored);
   cursor.seek("");
   return cursor.valid() ? cursor.key() : std::string();
@@ -2040,9 +2058,9 @@ std::optional<std::string> LSMTree::read(const std::string& key,
     }
     for (std::size_t index = first; index < last; ++index) {
       const Table& table = *tables[index];
-      ++bloom_checks_;
+      bloom_checks_.add();
       if (!table.bloom.maybe_contains(key)) {
-        ++bloom_negative_hits_;
+        bloom_negative_hits_.add();
         continue;
       }
       TableCursor cursor(table, block_cache_.get(), block_reads_);
@@ -2638,10 +2656,10 @@ Stats LSMTree::stats() const {
       stats.sstable_count += tables.size();
     }
   }
-  stats.bloom_checks = bloom_checks_;
-  stats.bloom_negative_hits = bloom_negative_hits_;
-  stats.block_reads = block_reads_;
-  stats.block_cache_hits = block_cache_->hits;
+  stats.bloom_checks = bloom_checks_.load();
+  stats.bloom_negative_hits = bloom_negative_hits_.load();
+  stats.block_reads = block_reads_.load();
+  stats.block_cache_hits = block_cache_->hits.load();
   stats.compaction_bytes_written = compaction_bytes_written_;
   return stats;
 }

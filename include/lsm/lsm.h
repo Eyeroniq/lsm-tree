@@ -54,6 +54,42 @@ struct Stats {
 
 class LSMTree;
 
+namespace detail {
+
+// A statistics counter that many threads can bump without contending:
+// each thread adds to its own cache-line-sized slot, and reading sums them.
+class ShardedCounter {
+ public:
+  void add(std::uint64_t amount = 1) noexcept {
+    slots_[slot()].value.fetch_add(amount, std::memory_order_relaxed);
+  }
+
+  std::uint64_t load() const noexcept {
+    std::uint64_t total = 0;
+    for (const auto& slot : slots_) {
+      total += slot.value.load(std::memory_order_relaxed);
+    }
+    return total;
+  }
+
+ private:
+  static constexpr std::size_t kSlots = 16;
+  struct alignas(64) Slot {
+    std::atomic<std::uint64_t> value{0};
+  };
+
+  static std::size_t slot() noexcept {
+    static std::atomic<std::size_t> next{0};
+    thread_local const std::size_t index =
+        next.fetch_add(1, std::memory_order_relaxed) % kSlots;
+    return index;
+  }
+
+  Slot slots_[kSlots];
+};
+
+}  // namespace detail
+
 // A consistent point-in-time view. Reads through a snapshot see exactly the
 // writes acknowledged before it was taken, however much is written,
 // flushed or compacted afterwards. Versions it can see are kept until it is
@@ -211,9 +247,9 @@ class LSMTree {
   bool manual_compaction_ = false;
   std::exception_ptr background_error_;
   std::thread worker_;
-  mutable std::atomic<std::uint64_t> bloom_checks_{0};
-  mutable std::atomic<std::uint64_t> bloom_negative_hits_{0};
-  mutable std::atomic<std::uint64_t> block_reads_{0};
+  mutable detail::ShardedCounter bloom_checks_;
+  mutable detail::ShardedCounter bloom_negative_hits_;
+  mutable detail::ShardedCounter block_reads_;
   mutable std::unique_ptr<BlockCache> block_cache_;
 };
 
