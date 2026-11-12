@@ -14,7 +14,10 @@ first principles.
 
 - acknowledged writes survive process crashes through an `fsync`-backed,
   checksummed WAL;
-- sorted memtables flush to immutable, checksummed SSTables;
+- sorted memtables flush to immutable, checksummed SSTables made of ~4 KB
+  data blocks; only a sparse block index and the Bloom filter stay in
+  memory, and a point read loads one block from disk;
+- an LRU block cache with a byte budget keeps hot blocks decoded in memory;
 - Bloom filters reject absent keys before table lookup;
 - newest-version-wins reads span memory and multiple disk generations;
 - ordered range scans reconcile versions and tombstones across every layer;
@@ -44,22 +47,29 @@ flowchart LR
 
 ## Measured, not implied
 
-Apple M2 Pro, macOS, Apple Clang 17:
-
 | Check | Result |
 |---|---:|
-| Correctness assertions | **4,079 passed** |
+| Correctness assertions | **4,311 passed** |
 | Seeded differential operations | 2,000 across five restarts |
 | Randomized hard-crash rounds | 100 |
 | Independently acknowledged writes lost | **0** |
-| Synchronous write throughput | **34,708 ops/s** |
-| Point-read throughput | **1.71M ops/s** |
 | Benchmark records recovered | 20,000 / 20,000 |
 
-The benchmark uses 20,000 writes and 20,000 seeded random reads. Writes call
-`fsync`; reads run against immutable disk generations loaded into a compact
-in-memory key index. These are local measurements, not universal hardware
-claims.
+Throughput, 20,000 `fsync`ed writes then 20,000 seeded random point reads
+(`make benchmark`), median of three runs on WSL2 Ubuntu 26.04 with g++ 15:
+
+| Configuration | Point reads | Writes |
+|---|---:|---:|
+| Block cache on (default 8 MiB) | **2.75M ops/s** | ~500 ops/s |
+| Block cache off: every read loads and verifies a block | 87K ops/s | ~400 ops/s |
+| Previous format, whole table in memory | 1.68M ops/s | ~410 ops/s |
+
+The benchmark data (about 1 MB) fits in the cache, so the cached row is the
+hot-set case; the uncached row is the floor when every read misses. Write
+throughput is bound by `fsync` on WSL's virtual disk and varies by about
+±20% between runs, so the write column shows no real difference. The same benchmark on
+an Apple M2 Pro measured 34,708 writes/s with the previous format. These are
+local measurements, not universal hardware claims.
 
 ## Verify it
 
@@ -84,12 +94,26 @@ CRASH_ROUNDS=1000 make crash-test
 active.wal
   [magic | sequence | put/delete | key_len | value_len | payload | CRC32]...
 
-sst-N.dat
+sst-N.dat (version 2, written by this release)
+  [magic | version]
+  data blocks, each ~block_bytes:
+    [sequence | tombstone | key_len | value_len | key | value]... [CRC32]
+  index, one entry per block:
+    [key_len | last_key | offset | size]... [CRC32]
+  [Bloom filter bytes]
+  footer (64 bytes):
+    [index offset/size | bloom offset/size | entry_count | max_sequence |
+     bloom bits/hashes | footer magic | CRC32]
+
+sst-N.dat (version 1, still readable)
   [magic | version | entry_count | bloom metadata]
   [Bloom filter bytes]
   [sequence | tombstone | key_len | value_len | key | value]...
   [whole-file CRC32]
 ```
+
+Version 1 tables are loaded whole, as before. The next compaction rewrites
+them as version 2, so existing databases migrate without a separate step.
 
 Flush ordering is deliberate: write temporary table → `fsync` table → atomic
 rename → `fsync` directory → reset WAL. Compaction follows the same
@@ -99,8 +123,10 @@ cannot expose an older value.
 ## Honest boundary
 
 This is a compact educational engine, not a RocksDB replacement. It currently
-has one writer, loads table indexes into memory, uses size-triggered full
-compaction, and does not implement snapshots or concurrent readers. The tests
+has one writer, keeps one index key per data block in memory, uses
+size-triggered full compaction (now streamed block by block, but still
+rewriting every table), and does not implement snapshots or concurrent
+readers. The tests
 focus on the invariants those future features must preserve.
 
 No database, serialization library, checksum package, Bloom-filter package, or
@@ -139,15 +165,28 @@ establish the persistence boundary the API promises.
 
 ## SSTable anatomy
 
-Tables are immutable after their temporary file is renamed. Opening a database
-checks the whole-file CRC, validates every length, requires strictly increasing
-keys, rejects values attached to tombstones, and refuses trailing bytes. A
-corrupt table fails open; it is never silently skipped, because skipping a
-newer generation could resurrect an older value.
+Tables are immutable after their temporary file is renamed. They are written
+by streaming sorted entries into ~4 KB data blocks, each with its own CRC32.
+When a block fills, its last key, offset and size go into the index. The
+index, Bloom filter and a fixed 64-byte footer close the file. Writing needs
+one block of memory, whatever the table size.
 
-The in-memory table index retains keys and values in this compact
-implementation. A production successor would store sparse fence pointers and
-read blocks on demand.
+Opening a table reads only the footer, index and Bloom filter. It checks
+their CRCs, requires the blocks to tile the data region exactly, and requires
+strictly increasing index keys. A corrupt footer or index fails open; it is
+never silently skipped, because skipping a newer generation could resurrect
+an older value.
+
+A point read binary-searches the index for the first block whose last key is
+at least the target, reads that one block, verifies its CRC, checks that its
+keys are strictly increasing and agree with the index, and then searches it.
+A damaged data block is therefore reported on the read that touches it,
+instead of returning suspect data. Compaction reads every block, so it also
+fails on any damaged block rather than copying it forward.
+
+Decoded blocks go into an LRU cache with a byte budget
+(`Options::block_cache_bytes`). Compaction bypasses the cache so that a
+full rewrite does not evict the blocks serving reads.
 
 ## Bloom filters
 
@@ -190,7 +229,7 @@ does not pretend to have that proof.
 
 ## Verification strategy
 
-The 4,079 assertions include:
+The 4,311 assertions include:
 
 - values, overwrites and deletes across process reopen;
 - newest-version-wins reads across multiple SSTables;
@@ -202,9 +241,18 @@ The 4,079 assertions include:
   acknowledged afterwards still survive reopen;
 - a second open of a locked database directory is refused;
 - half-written `sst-N.dat.tmp` files left by a crash are removed on open;
+- a hand-built version 1 table is read, then migrated to version 2 by
+  compaction;
+- a point read loads exactly one block, a repeat read is a cache hit, and
+  Bloom-negative lookups load none;
+- a corrupted data block opens cleanly but fails the reads and scans that
+  touch it, while other blocks stay readable;
+- a 100 KB value larger than a block round-trips through flush and
+  compaction;
 - 2,000 seeded random mutations checked against `std::map` through five
   reopen cycles;
-- automatic flush and compaction under a 90-byte memtable limit.
+- automatic flush and compaction under a 90-byte memtable limit and 64-byte
+  blocks, so cursors cross block boundaries constantly.
 
 The crash harness is deliberately external. A Python parent launches a writer,
 enables seven-byte physical writes, waits a seeded random interval, sends
@@ -222,6 +270,8 @@ lsm::Options options;
 options.memtable_bytes = 64 * 1024;
 options.bloom_bits_per_key = 10;
 options.compaction_trigger = 4;
+options.block_bytes = 4096;
+options.block_cache_bytes = 8 * 1024 * 1024;
 
 lsm::LSMTree db("data", options);
 db.put("customer:42", "active");
@@ -300,7 +350,8 @@ Dockerfile               engine library + service in one image
 
 ## What would come next
 
-- block-based SSTables with sparse fence pointers and a block cache;
+- restart points inside blocks, so a lookup can binary-search a block instead
+  of decoding all of it;
 - leveled or size-tiered compaction instead of full-table merging;
 - manifest/version sets for atomic table membership;
 - snapshots and concurrent readers;

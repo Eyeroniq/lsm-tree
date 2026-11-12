@@ -15,6 +15,11 @@ struct Options {
   std::size_t memtable_bytes = 64 * 1024;
   std::size_t bloom_bits_per_key = 10;
   std::size_t compaction_trigger = 4;
+  // Target size of an SSTable data block. Only one key per block is kept in
+  // memory; a point read loads a single block from disk.
+  std::size_t block_bytes = 4096;
+  // Budget for decoded data blocks kept in memory (LRU). 0 disables caching.
+  std::size_t block_cache_bytes = 8 * 1024 * 1024;
   bool sync_writes = true;
 };
 
@@ -24,12 +29,17 @@ struct Stats {
   std::uint64_t sequence = 0;
   std::uint64_t bloom_checks = 0;
   std::uint64_t bloom_negative_hits = 0;
+  // SSTable data blocks read from disk (and checksum-verified).
+  std::uint64_t block_reads = 0;
+  // Block lookups served from the block cache instead of disk.
+  std::uint64_t block_cache_hits = 0;
 };
 
 class LSMTree {
  public:
   struct Entry;
   struct Table;
+  struct BlockCache;
 
   explicit LSMTree(std::filesystem::path directory,
                    Options options = Options{});
@@ -54,8 +64,10 @@ class LSMTree {
   void acquire_lock();
   void discover_tables();
   void recover_wal();
-  std::shared_ptr<Table> write_table(
-      const std::map<std::string, Entry>& entries);
+  std::filesystem::path table_path(std::uint64_t generation,
+                                   bool temporary) const;
+  std::shared_ptr<Table> install_table(const std::filesystem::path& temporary,
+                                       std::uint64_t generation);
   void reset_wal();
   void sync_directory() const;
   void require_writable() const;
@@ -78,6 +90,8 @@ class LSMTree {
   std::vector<std::shared_ptr<Table>> tables_;
   mutable std::uint64_t bloom_checks_ = 0;
   mutable std::uint64_t bloom_negative_hits_ = 0;
+  mutable std::uint64_t block_reads_ = 0;
+  mutable std::unique_ptr<BlockCache> block_cache_;
 };
 
 std::uint32_t crc32(const std::uint8_t* data, std::size_t size);
