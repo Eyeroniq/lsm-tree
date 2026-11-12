@@ -1,32 +1,42 @@
 #include "lsm/lsm.h"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cctype>
 #include <cstring>
 #include <cstdlib>
 #include <fcntl.h>
 #include <limits>
+#include <list>
 #include <stdexcept>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
-#include <unordered_set>
 #include <utility>
 
 namespace lsm {
 namespace {
 
-constexpr std::uint32_t kWalMagic = 0x314C4157U;    // WAL1
-constexpr std::uint32_t kTableMagic = 0x31545353U;  // SST1
-constexpr std::uint32_t kVersion = 1;
+constexpr std::uint32_t kWalMagic = 0x314C4157U;     // WAL1
+constexpr std::uint32_t kTableMagic = 0x31545353U;   // SST1
+constexpr std::uint32_t kFooterMagic = 0x46545353U;  // SSTF
+// Version 1 tables are loaded whole into memory. Version 2 tables keep only
+// a sparse block index and the Bloom filter in memory and read data blocks
+// on demand. Both are readable; new tables are always written as version 2.
+constexpr std::uint32_t kTableVersion1 = 1;
+constexpr std::uint32_t kTableVersion2 = 2;
 constexpr std::size_t kWalHeader = 24;
-constexpr std::size_t kTableHeader = 24;
+constexpr std::size_t kV1Header = 24;
+constexpr std::size_t kV2Header = 8;
+constexpr std::size_t kV2Footer = 64;
 constexpr std::size_t kEntryHeader = 20;
 constexpr std::size_t kChecksum = 4;
 constexpr std::uint32_t kMaxKey = 1U << 20;
 constexpr std::uint32_t kMaxValue = 16U << 20;
+// The Bloom bit count is stored as a u32.
+constexpr std::size_t kMaxBloomBits = 0xFFFFFFC0U;
 
 [[noreturn]] void system_error(const std::string& operation) {
   throw std::runtime_error(operation + ": " + std::strerror(errno));
@@ -127,7 +137,8 @@ class Bloom {
   Bloom() = default;
 
   Bloom(std::size_t key_count, std::size_t bits_per_key) {
-    bit_count_ = std::max<std::size_t>(64, key_count * bits_per_key);
+    bit_count_ = std::min(kMaxBloomBits,
+                          std::max<std::size_t>(64, key_count * bits_per_key));
     bytes_.assign((bit_count_ + 7) / 8, 0);
     hash_count_ = static_cast<std::uint32_t>(
         std::clamp<std::size_t>(bits_per_key * 69 / 100, 1, 12));
@@ -140,6 +151,9 @@ class Bloom {
         hash_count_(hash_count) {}
 
   void add(const std::string& key) {
+    if (bytes_.empty()) {
+      return;
+    }
     const std::uint64_t first = fnv1a(key);
     const std::uint64_t second = mix(first) | 1ULL;
     for (std::uint32_t i = 0; i < hash_count_; ++i) {
@@ -192,6 +206,30 @@ std::uint64_t generation_from_path(const std::filesystem::path& path) {
   return std::stoull(number);
 }
 
+// Standard reflected CRC-32 (polynomial 0xEDB88320), one table lookup per
+// byte instead of eight shift/xor rounds.
+const std::array<std::uint32_t, 256>& crc_table() {
+  static const std::array<std::uint32_t, 256> table = [] {
+    std::array<std::uint32_t, 256> values{};
+    for (std::uint32_t index = 0; index < 256; ++index) {
+      std::uint32_t crc = index;
+      for (int bit = 0; bit < 8; ++bit) {
+        crc = (crc & 1U) != 0 ? (crc >> 1) ^ 0xEDB88320U : crc >> 1;
+      }
+      values[index] = crc;
+    }
+    return values;
+  }();
+  return table;
+}
+
+// One data block of a version 2 table: the last key it holds and its extent.
+struct BlockHandle {
+  std::string last_key;
+  std::uint64_t offset = 0;
+  std::uint32_t size = 0;  // Includes the trailing block CRC.
+};
+
 }  // namespace
 
 struct LSMTree::Entry {
@@ -203,113 +241,542 @@ struct LSMTree::Entry {
 struct LSMTree::Table {
   std::filesystem::path path;
   std::uint64_t generation = 0;
+  std::uint32_t version = 0;
+  std::uint64_t entry_count = 0;
+  std::uint64_t max_sequence = 0;
   Bloom bloom;
+  // Version 1: every entry, loaded at open.
   std::vector<std::pair<std::string, Entry>> entries;
+  // Version 2: one handle per data block; blocks are read on demand.
+  std::vector<BlockHandle> index;
+  int fd = -1;  // Open for version 2 tables only.
+
+  Table() = default;
+  Table(const Table&) = delete;
+  Table& operator=(const Table&) = delete;
+  ~Table() {
+    if (fd >= 0) {
+      ::close(fd);
+    }
+  }
 };
 
 std::uint32_t crc32(const std::uint8_t* data, std::size_t size) {
+  const auto& table = crc_table();
   std::uint32_t crc = 0xFFFFFFFFU;
   for (std::size_t i = 0; i < size; ++i) {
-    crc ^= data[i];
-    for (int bit = 0; bit < 8; ++bit) {
-      const std::uint32_t mask =
-          static_cast<std::uint32_t>(-static_cast<std::int32_t>(crc & 1U));
-      crc = (crc >> 1) ^ (0xEDB88320U & mask);
-    }
+    crc = table[(crc ^ data[i]) & 0xFFU] ^ (crc >> 8);
   }
   return ~crc;
 }
 
 namespace {
 
-std::shared_ptr<LSMTree::Table> load_table(
-    const std::filesystem::path& path) {
-  const std::uint64_t generation = generation_from_path(path);
-  const int fd = ::open(path.c_str(), O_RDONLY);
-  if (fd < 0) {
+using Entry = LSMTree::Entry;
+using Table = LSMTree::Table;
+using EntryList = std::vector<std::pair<std::string, Entry>>;
+
+}  // namespace
+
+// LRU cache of decoded, checksum-verified data blocks, keyed by
+// (table generation, block index). Generations are never reused while the
+// database is open, so a cached block can never go stale; blocks of tables
+// removed by compaction simply age out.
+struct LSMTree::BlockCache {
+  using Key = std::pair<std::uint64_t, std::size_t>;
+  struct Slot {
+    Key key;
+    std::shared_ptr<const EntryList> block;
+    std::size_t charge;
+  };
+
+  explicit BlockCache(std::size_t capacity_bytes) : capacity(capacity_bytes) {}
+
+  std::shared_ptr<const EntryList> find(const Key& key) {
+    const auto found = slots.find(key);
+    if (found == slots.end()) {
+      return nullptr;
+    }
+    lru.splice(lru.begin(), lru, found->second);
+    ++hits;
+    return found->second->block;
+  }
+
+  void insert(const Key& key, std::shared_ptr<const EntryList> block,
+              std::size_t charge) {
+    if (charge > capacity || slots.count(key) != 0) {
+      return;
+    }
+    lru.push_front({key, std::move(block), charge});
+    slots[key] = lru.begin();
+    used += charge;
+    while (used > capacity) {
+      used -= lru.back().charge;
+      slots.erase(lru.back().key);
+      lru.pop_back();
+    }
+  }
+
+  std::size_t capacity;
+  std::size_t used = 0;
+  std::uint64_t hits = 0;
+  std::list<Slot> lru;  // Most recently used first.
+  std::map<Key, std::list<Slot>::iterator> slots;
+};
+
+namespace {
+
+// Entry encoding shared by both table versions:
+//   [sequence u64 | tombstone u8 | 3 zero bytes | key_len u32 | value_len u32
+//    | key | value]
+void encode_entry(std::vector<std::uint8_t>& out, const std::string& key,
+                  const Entry& entry) {
+  append_u64(out, entry.sequence);
+  out.push_back(entry.tombstone ? 1 : 0);
+  out.insert(out.end(), 3, 0);
+  append_u32(out, static_cast<std::uint32_t>(key.size()));
+  append_u32(out, static_cast<std::uint32_t>(entry.value.size()));
+  out.insert(out.end(), key.begin(), key.end());
+  out.insert(out.end(), entry.value.begin(), entry.value.end());
+}
+
+// Decodes the entry at `offset` (which must be <= limit) and advances past it.
+void decode_entry(const std::uint8_t* data, std::size_t limit,
+                  std::size_t& offset, std::string& key, Entry& entry) {
+  if (limit - offset < kEntryHeader) {
+    throw std::runtime_error("truncated SSTable entry");
+  }
+  const std::uint8_t* header = data + offset;
+  const std::uint8_t flag = header[8];
+  if (flag > 1 || header[9] != 0 || header[10] != 0 || header[11] != 0) {
+    throw std::runtime_error("invalid SSTable entry flags");
+  }
+  const std::uint32_t key_length = read_u32(header + 12);
+  const std::uint32_t value_length = read_u32(header + 16);
+  if (key_length == 0 || key_length > kMaxKey || value_length > kMaxValue ||
+      limit - offset - kEntryHeader <
+          static_cast<std::size_t>(key_length) + value_length) {
+    throw std::runtime_error("invalid SSTable entry length");
+  }
+  const char* payload = reinterpret_cast<const char*>(header + kEntryHeader);
+  entry.sequence = read_u64(header);
+  entry.tombstone = flag == 1;
+  key.assign(payload, key_length);
+  entry.value.assign(payload + key_length, value_length);
+  if (entry.tombstone && !entry.value.empty()) {
+    throw std::runtime_error("tombstone has a value");
+  }
+  offset += kEntryHeader + key_length + value_length;
+}
+
+// Version 1: [header 24 | bloom | entries... | whole-file CRC32].
+void load_v1(Table& table, std::size_t size) {
+  if (size < kV1Header + kChecksum) {
+    throw std::runtime_error("SSTable is too small");
+  }
+  std::vector<std::uint8_t> bytes(size);
+  if (!read_exact(table.fd, 0, bytes.data(), bytes.size())) {
+    throw std::runtime_error("short SSTable read");
+  }
+  const std::size_t limit = size - kChecksum;
+  if (crc32(bytes.data(), limit) != read_u32(bytes.data() + limit)) {
+    throw std::runtime_error("SSTable checksum mismatch");
+  }
+  const std::uint64_t count = read_u64(bytes.data() + 8);
+  const std::uint32_t bloom_bits = read_u32(bytes.data() + 16);
+  const std::uint32_t bloom_hashes = read_u32(bytes.data() + 20);
+  const std::size_t bloom_bytes =
+      static_cast<std::size_t>((static_cast<std::uint64_t>(bloom_bits) + 7) / 8);
+  if (bloom_bytes > limit - kV1Header) {
+    throw std::runtime_error("invalid SSTable Bloom filter length");
+  }
+  const auto bloom_begin = bytes.begin() + static_cast<std::ptrdiff_t>(kV1Header);
+  table.bloom = Bloom(
+      std::vector<std::uint8_t>(
+          bloom_begin, bloom_begin + static_cast<std::ptrdiff_t>(bloom_bytes)),
+      bloom_bits, bloom_hashes);
+  std::size_t offset = kV1Header + bloom_bytes;
+  for (std::uint64_t index = 0; index < count; ++index) {
+    std::string key;
+    Entry entry;
+    decode_entry(bytes.data(), limit, offset, key, entry);
+    if (!table.entries.empty() && table.entries.back().first >= key) {
+      throw std::runtime_error("SSTable keys are not strictly ordered");
+    }
+    table.max_sequence = std::max(table.max_sequence, entry.sequence);
+    table.entries.emplace_back(std::move(key), std::move(entry));
+  }
+  if (offset != limit) {
+    throw std::runtime_error("unexpected bytes after SSTable entries");
+  }
+  table.entry_count = table.entries.size();
+}
+
+// Version 2:
+//   [magic u32 | version u32]
+//   data blocks:  [entries... | block CRC32]...
+//   index:        [key_len u32 | last_key | offset u64 | size u32]... | CRC32
+//   Bloom filter bytes
+//   footer (64):  [index_offset u64 | index_size u64 | bloom_offset u64 |
+//                  bloom_bytes u64 | entry_count u64 | max_sequence u64 |
+//                  bloom_bits u32 | bloom_hashes u32 | magic u32 | CRC32]
+// Opening reads and verifies only the footer, index and Bloom filter. Data
+// blocks are verified when they are read.
+void load_v2(Table& table, std::size_t size) {
+  if (size < kV2Header + kV2Footer) {
+    throw std::runtime_error("SSTable is too small");
+  }
+  const std::uint64_t data_end = size - kV2Footer;
+  std::uint8_t footer[kV2Footer];
+  if (!read_exact(table.fd, data_end, footer, kV2Footer)) {
+    throw std::runtime_error("short SSTable footer read");
+  }
+  if (crc32(footer, kV2Footer - kChecksum) !=
+      read_u32(footer + kV2Footer - kChecksum)) {
+    throw std::runtime_error("SSTable footer checksum mismatch");
+  }
+  if (read_u32(footer + 56) != kFooterMagic) {
+    throw std::runtime_error("invalid SSTable footer");
+  }
+  const std::uint64_t index_offset = read_u64(footer);
+  const std::uint64_t index_size = read_u64(footer + 8);
+  const std::uint64_t bloom_offset = read_u64(footer + 16);
+  const std::uint64_t bloom_bytes = read_u64(footer + 24);
+  const std::uint64_t entry_count = read_u64(footer + 32);
+  const std::uint64_t max_sequence = read_u64(footer + 40);
+  const std::uint32_t bloom_bits = read_u32(footer + 48);
+  const std::uint32_t bloom_hashes = read_u32(footer + 52);
+  if (index_offset < kV2Header || index_offset > data_end ||
+      index_size < kChecksum || index_size > data_end - index_offset ||
+      bloom_offset != index_offset + index_size ||
+      bloom_bytes != data_end - bloom_offset || bloom_bits == 0 ||
+      bloom_bytes != (static_cast<std::uint64_t>(bloom_bits) + 7) / 8 ||
+      bloom_hashes == 0 || bloom_hashes > 32) {
+    throw std::runtime_error("invalid SSTable layout");
+  }
+
+  std::vector<std::uint8_t> index(static_cast<std::size_t>(index_size));
+  if (!read_exact(table.fd, index_offset, index.data(), index.size())) {
+    throw std::runtime_error("short SSTable index read");
+  }
+  const std::size_t limit = index.size() - kChecksum;
+  if (crc32(index.data(), limit) != read_u32(index.data() + limit)) {
+    throw std::runtime_error("SSTable index checksum mismatch");
+  }
+  std::uint64_t expected_offset = kV2Header;
+  std::size_t position = 0;
+  while (position < limit) {
+    if (limit - position < 4) {
+      throw std::runtime_error("invalid SSTable index entry");
+    }
+    const std::uint32_t key_length = read_u32(index.data() + position);
+    position += 4;
+    if (key_length == 0 || key_length > kMaxKey ||
+        limit - position < static_cast<std::size_t>(key_length) + 12) {
+      throw std::runtime_error("invalid SSTable index entry");
+    }
+    BlockHandle handle;
+    handle.last_key.assign(
+        reinterpret_cast<const char*>(index.data() + position), key_length);
+    position += key_length;
+    handle.offset = read_u64(index.data() + position);
+    handle.size = read_u32(index.data() + position + 8);
+    position += 12;
+    if (handle.offset != expected_offset ||
+        handle.size < kEntryHeader + 1 + kChecksum ||
+        handle.size > index_offset - handle.offset) {
+      throw std::runtime_error("invalid SSTable block extent");
+    }
+    if (!table.index.empty() && table.index.back().last_key >= handle.last_key) {
+      throw std::runtime_error("SSTable index keys are not strictly ordered");
+    }
+    expected_offset += handle.size;
+    table.index.push_back(std::move(handle));
+  }
+  if (expected_offset != index_offset ||
+      (entry_count == 0) != table.index.empty()) {
+    throw std::runtime_error("SSTable blocks do not match the index");
+  }
+
+  std::vector<std::uint8_t> bloom(static_cast<std::size_t>(bloom_bytes));
+  if (!read_exact(table.fd, bloom_offset, bloom.data(), bloom.size())) {
+    throw std::runtime_error("short SSTable Bloom filter read");
+  }
+  table.bloom = Bloom(std::move(bloom), bloom_bits, bloom_hashes);
+  table.entry_count = entry_count;
+  table.max_sequence = max_sequence;
+}
+
+std::shared_ptr<Table> load_table(const std::filesystem::path& path) {
+  auto table = std::make_shared<Table>();
+  table->path = path;
+  table->generation = generation_from_path(path);
+  table->fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (table->fd < 0) {
     system_error("open SSTable");
   }
+  struct stat info {};
+  if (::fstat(table->fd, &info) != 0) {
+    system_error("fstat SSTable");
+  }
+  const std::size_t size = static_cast<std::size_t>(info.st_size);
+  std::uint8_t header[kV2Header];
+  if (size < kV2Header || !read_exact(table->fd, 0, header, kV2Header) ||
+      read_u32(header) != kTableMagic) {
+    throw std::runtime_error("unsupported SSTable header");
+  }
+  table->version = read_u32(header + 4);
+  if (table->version == kTableVersion1) {
+    load_v1(*table, size);
+    ::close(table->fd);  // Everything is in memory now.
+    table->fd = -1;
+  } else if (table->version == kTableVersion2) {
+    load_v2(*table, size);
+  } else {
+    throw std::runtime_error("unsupported SSTable version");
+  }
+  return table;
+}
+
+// Reads one data block of a version 2 table and verifies its checksum and
+// its agreement with the index.
+EntryList read_block(const Table& table, std::size_t block) {
+  const BlockHandle& handle = table.index[block];
+  std::vector<std::uint8_t> bytes(handle.size);
+  if (!read_exact(table.fd, handle.offset, bytes.data(), bytes.size())) {
+    throw std::runtime_error("short SSTable block read");
+  }
+  const std::size_t limit = bytes.size() - kChecksum;
+  if (crc32(bytes.data(), limit) != read_u32(bytes.data() + limit)) {
+    throw std::runtime_error("SSTable block checksum mismatch in " +
+                             table.path.filename().string());
+  }
+  EntryList entries;
+  std::size_t offset = 0;
+  while (offset < limit) {
+    std::string key;
+    Entry entry;
+    decode_entry(bytes.data(), limit, offset, key, entry);
+    if (!entries.empty() && entries.back().first >= key) {
+      throw std::runtime_error("SSTable keys are not strictly ordered");
+    }
+    entries.emplace_back(std::move(key), std::move(entry));
+  }
+  if (entries.empty() || entries.back().first != handle.last_key ||
+      (block > 0 && entries.front().first <= table.index[block - 1].last_key)) {
+    throw std::runtime_error("SSTable block does not match its index entry");
+  }
+  return entries;
+}
+
+// Ordered iteration over one table, for either format. Holds at most one
+// data block of a version 2 table. With a null cache every block comes from
+// disk and nothing is cached (compaction uses this to avoid evicting the
+// blocks that serve reads).
+class TableCursor {
+ public:
+  TableCursor(const Table& table, LSMTree::BlockCache* cache,
+              std::uint64_t& block_reads)
+      : table_(table), cache_(cache), block_reads_(block_reads) {}
+
+  // Positions at the first key >= target.
+  void seek(const std::string& target) {
+    if (table_.version == kTableVersion1) {
+      position_ = static_cast<std::size_t>(
+          std::lower_bound(table_.entries.begin(), table_.entries.end(), target,
+                           [](const auto& item, const std::string& key) {
+                             return item.first < key;
+                           }) -
+          table_.entries.begin());
+      return;
+    }
+    block_ = static_cast<std::size_t>(
+        std::lower_bound(table_.index.begin(), table_.index.end(), target,
+                         [](const BlockHandle& handle, const std::string& key) {
+                           return handle.last_key < key;
+                         }) -
+        table_.index.begin());
+    position_ = 0;
+    block_entries_.reset();
+    if (block_ == table_.index.size()) {
+      return;
+    }
+    load_block();
+    // The block's last key is >= target, so this lands inside the block.
+    position_ = static_cast<std::size_t>(
+        std::lower_bound(block_entries_->begin(), block_entries_->end(), target,
+                         [](const auto& item, const std::string& key) {
+                           return item.first < key;
+                         }) -
+        block_entries_->begin());
+  }
+
+  bool valid() const {
+    if (table_.version == kTableVersion1) {
+      return position_ < table_.entries.size();
+    }
+    return block_entries_ != nullptr && position_ < block_entries_->size();
+  }
+
+  const std::string& key() const { return current().first; }
+  const Entry& entry() const { return current().second; }
+
+  void next() {
+    ++position_;
+    if (table_.version == kTableVersion2 &&
+        position_ == block_entries_->size()) {
+      ++block_;
+      position_ = 0;
+      block_entries_.reset();
+      if (block_ < table_.index.size()) {
+        load_block();
+      }
+    }
+  }
+
+ private:
+  const std::pair<std::string, Entry>& current() const {
+    return table_.version == kTableVersion1 ? table_.entries[position_]
+                                            : (*block_entries_)[position_];
+  }
+
+  void load_block() {
+    const LSMTree::BlockCache::Key key{table_.generation, block_};
+    if (cache_ != nullptr) {
+      block_entries_ = cache_->find(key);
+      if (block_entries_ != nullptr) {
+        return;
+      }
+    }
+    auto loaded = std::make_shared<const EntryList>(read_block(table_, block_));
+    ++block_reads_;
+    if (cache_ != nullptr) {
+      // Charge the on-disk size plus a rough per-entry allocation overhead.
+      cache_->insert(key, loaded,
+                     table_.index[block_].size + loaded->size() * 64);
+    }
+    block_entries_ = std::move(loaded);
+  }
+
+  const Table& table_;
+  LSMTree::BlockCache* cache_;
+  std::uint64_t& block_reads_;
+  std::size_t block_ = 0;
+  std::size_t position_ = 0;
+  std::shared_ptr<const EntryList> block_entries_;
+};
+
+// Streams sorted entries into a new version 2 table. Memory use is one data
+// block plus the index and Bloom filter, regardless of table size.
+class TableWriter {
+ public:
+  TableWriter(const std::filesystem::path& path, std::size_t block_bytes,
+              std::size_t bloom_bits_per_key, std::size_t expected_keys)
+      : block_bytes_(block_bytes),
+        bloom_(std::max<std::size_t>(expected_keys, 1), bloom_bits_per_key) {
+    fd_ = ::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+    if (fd_ < 0) {
+      system_error("create SSTable");
+    }
+    std::vector<std::uint8_t> header;
+    append_u32(header, kTableMagic);
+    append_u32(header, kTableVersion2);
+    write(header);
+  }
+
+  TableWriter(const TableWriter&) = delete;
+  TableWriter& operator=(const TableWriter&) = delete;
+
+  ~TableWriter() {
+    if (fd_ >= 0) {
+      ::close(fd_);
+    }
+  }
+
+  // Keys must arrive in strictly increasing order.
+  void add(const std::string& key, const Entry& entry) {
+    encode_entry(block_, key, entry);
+    last_key_ = key;
+    bloom_.add(key);
+    max_sequence_ = std::max(max_sequence_, entry.sequence);
+    ++count_;
+    if (block_.size() >= block_bytes_) {
+      flush_block();
+    }
+  }
+
+  // Writes the index, Bloom filter and footer, then fsyncs and closes.
+  void finish() {
+    flush_block();
+    const std::uint64_t index_offset = offset_;
+    append_u32(index_, crc32(index_.data(), index_.size()));
+    write(index_);
+    const std::uint64_t bloom_offset = offset_;
+    write(bloom_.bytes());
+    std::vector<std::uint8_t> footer;
+    append_u64(footer, index_offset);
+    append_u64(footer, bloom_offset - index_offset);
+    append_u64(footer, bloom_offset);
+    append_u64(footer, bloom_.bytes().size());
+    append_u64(footer, count_);
+    append_u64(footer, max_sequence_);
+    append_u32(footer, static_cast<std::uint32_t>(bloom_.bit_count()));
+    append_u32(footer, bloom_.hash_count());
+    append_u32(footer, kFooterMagic);
+    append_u32(footer, crc32(footer.data(), footer.size()));
+    write(footer);
+    if (::fsync(fd_) != 0) {
+      system_error("fsync SSTable");
+    }
+    const int fd = fd_;
+    fd_ = -1;
+    if (::close(fd) != 0) {
+      system_error("close SSTable");
+    }
+  }
+
+ private:
+  void flush_block() {
+    if (block_.empty()) {
+      return;
+    }
+    append_u32(block_, crc32(block_.data(), block_.size()));
+    append_u32(index_, static_cast<std::uint32_t>(last_key_.size()));
+    index_.insert(index_.end(), last_key_.begin(), last_key_.end());
+    append_u64(index_, offset_);
+    append_u32(index_, static_cast<std::uint32_t>(block_.size()));
+    write(block_);
+    block_.clear();
+  }
+
+  void write(const std::vector<std::uint8_t>& bytes) {
+    write_all(fd_, bytes.data(), bytes.size());
+    offset_ += bytes.size();
+  }
+
+  std::size_t block_bytes_;
+  Bloom bloom_;
+  int fd_ = -1;
+  std::uint64_t offset_ = 0;
+  std::vector<std::uint8_t> block_;
+  std::vector<std::uint8_t> index_;
+  std::string last_key_;
+  std::uint64_t count_ = 0;
+  std::uint64_t max_sequence_ = 0;
+};
+
+// Builds a table at `path`, removing the partial file if anything fails.
+template <typename Fill>
+void build_table(const std::filesystem::path& path, const Options& options,
+                 std::size_t expected_keys, Fill&& fill) {
   try {
-    struct stat info {};
-    if (::fstat(fd, &info) != 0) {
-      system_error("fstat SSTable");
-    }
-    const std::size_t size = static_cast<std::size_t>(info.st_size);
-    if (size < kTableHeader + kChecksum) {
-      throw std::runtime_error("SSTable is too small");
-    }
-    std::vector<std::uint8_t> bytes(size);
-    if (!read_exact(fd, 0, bytes.data(), bytes.size())) {
-      throw std::runtime_error("short SSTable read");
-    }
-    if (read_u32(bytes.data()) != kTableMagic ||
-        read_u32(bytes.data() + 4) != kVersion) {
-      throw std::runtime_error("unsupported SSTable header");
-    }
-    const std::uint32_t stored_crc = read_u32(bytes.data() + size - kChecksum);
-    if (crc32(bytes.data(), size - kChecksum) != stored_crc) {
-      throw std::runtime_error("SSTable checksum mismatch");
-    }
-
-    const std::uint64_t count = read_u64(bytes.data() + 8);
-    const std::uint32_t bloom_bits = read_u32(bytes.data() + 16);
-    const std::uint32_t bloom_hashes = read_u32(bytes.data() + 20);
-    const std::size_t bloom_bytes = (bloom_bits + 7U) / 8U;
-    if (kTableHeader + bloom_bytes + kChecksum > size) {
-      throw std::runtime_error("invalid SSTable Bloom filter length");
-    }
-    std::vector<std::uint8_t> bloom(
-        bytes.begin() + static_cast<std::ptrdiff_t>(kTableHeader),
-        bytes.begin() +
-            static_cast<std::ptrdiff_t>(kTableHeader + bloom_bytes));
-
-    auto table = std::make_shared<LSMTree::Table>();
-    table->path = path;
-    table->generation = generation;
-    table->bloom = Bloom(std::move(bloom), bloom_bits, bloom_hashes);
-    std::size_t offset = kTableHeader + bloom_bytes;
-    for (std::uint64_t index = 0; index < count; ++index) {
-      if (offset + kEntryHeader > size - kChecksum) {
-        throw std::runtime_error("truncated SSTable entry");
-      }
-      const std::uint64_t sequence = read_u64(bytes.data() + offset);
-      const bool tombstone = bytes[offset + 8] != 0;
-      if (bytes[offset + 9] != 0 || bytes[offset + 10] != 0 ||
-          bytes[offset + 11] != 0) {
-        throw std::runtime_error("invalid SSTable entry flags");
-      }
-      const std::uint32_t key_length = read_u32(bytes.data() + offset + 12);
-      const std::uint32_t value_length = read_u32(bytes.data() + offset + 16);
-      const std::size_t record_size =
-          kEntryHeader + static_cast<std::size_t>(key_length) +
-          static_cast<std::size_t>(value_length);
-      if (key_length == 0 || key_length > kMaxKey ||
-          value_length > kMaxValue ||
-          offset + record_size > size - kChecksum) {
-        throw std::runtime_error("invalid SSTable entry length");
-      }
-      const char* payload =
-          reinterpret_cast<const char*>(bytes.data() + offset + kEntryHeader);
-      std::string key(payload, key_length);
-      std::string value(payload + key_length, value_length);
-      if (tombstone && !value.empty()) {
-        throw std::runtime_error("tombstone has a value");
-      }
-      if (!table->entries.empty() &&
-          table->entries.back().first >= key) {
-        throw std::runtime_error("SSTable keys are not strictly ordered");
-      }
-      table->entries.push_back(
-          {std::move(key), {sequence, tombstone, std::move(value)}});
-      offset += record_size;
-    }
-    if (offset != size - kChecksum) {
-      throw std::runtime_error("unexpected bytes after SSTable entries");
-    }
-    ::close(fd);
-    return table;
+    TableWriter writer(path, options.block_bytes, options.bloom_bits_per_key,
+                       expected_keys);
+    fill(writer);
+    writer.finish();
   } catch (...) {
-    ::close(fd);
+    std::error_code ignored;
+    std::filesystem::remove(path, ignored);
     throw;
   }
 }
@@ -321,9 +788,10 @@ LSMTree::LSMTree(std::filesystem::path directory, Options options)
       wal_path_(directory_ / "active.wal"),
       options_(options) {
   if (options_.memtable_bytes == 0 || options_.bloom_bits_per_key == 0 ||
-      options_.compaction_trigger < 2) {
+      options_.compaction_trigger < 2 || options_.block_bytes == 0) {
     throw std::invalid_argument("invalid LSM options");
   }
+  block_cache_ = std::make_unique<BlockCache>(options_.block_cache_bytes);
   std::filesystem::create_directories(directory_);
   acquire_lock();
   try {
@@ -405,10 +873,7 @@ void LSMTree::discover_tables() {
               return left->generation > right->generation;
             });
   for (const auto& table : tables_) {
-    for (const auto& [key, entry] : table->entries) {
-      static_cast<void>(key);
-      sequence_ = std::max(sequence_, entry.sequence);
-    }
+    sequence_ = std::max(sequence_, table->max_sequence);
   }
 }
 
@@ -546,15 +1011,12 @@ std::optional<std::string> LSMTree::get(const std::string& key) const {
       ++bloom_negative_hits_;
       continue;
     }
-    const auto found = std::lower_bound(
-        table->entries.begin(), table->entries.end(), key,
-        [](const auto& item, const std::string& target) {
-          return item.first < target;
-        });
-    if (found != table->entries.end() && found->first == key) {
-      return found->second.tombstone
+    TableCursor cursor(*table, block_cache_.get(), block_reads_);
+    cursor.seek(key);
+    if (cursor.valid() && cursor.key() == key) {
+      return cursor.entry().tombstone
                  ? std::nullopt
-                 : std::optional<std::string>(found->second.value);
+                 : std::optional<std::string>(cursor.entry().value);
     }
   }
   return std::nullopt;
@@ -567,20 +1029,13 @@ std::vector<std::pair<std::string, std::string>> LSMTree::scan(
   }
   std::map<std::string, Entry> latest;
   for (const auto& table : tables_) {
-    // Entries are sorted, so jump to the first key in range instead of
-    // walking the whole table.
-    auto item = std::lower_bound(
-        table->entries.begin(), table->entries.end(), begin,
-        [](const auto& candidate, const std::string& target) {
-          return candidate.first < target;
-        });
-    for (; item != table->entries.end() &&
-           (end.empty() || item->first < end);
-         ++item) {
-      const auto current = latest.find(item->first);
+    TableCursor cursor(*table, block_cache_.get(), block_reads_);
+    for (cursor.seek(begin);
+         cursor.valid() && (end.empty() || cursor.key() < end); cursor.next()) {
+      const auto current = latest.find(cursor.key());
       if (current == latest.end() ||
-          current->second.sequence < item->second.sequence) {
-        latest[item->first] = item->second;
+          current->second.sequence < cursor.entry().sequence) {
+        latest[cursor.key()] = cursor.entry();
       }
     }
   }
@@ -604,49 +1059,15 @@ std::vector<std::pair<std::string, std::string>> LSMTree::scan(
   return output;
 }
 
-std::shared_ptr<LSMTree::Table> LSMTree::write_table(
-    const std::map<std::string, Entry>& entries) {
-  Bloom bloom(entries.size(), options_.bloom_bits_per_key);
-  for (const auto& [key, entry] : entries) {
-    static_cast<void>(entry);
-    bloom.add(key);
-  }
-  std::vector<std::uint8_t> bytes;
-  append_u32(bytes, kTableMagic);
-  append_u32(bytes, kVersion);
-  append_u64(bytes, entries.size());
-  append_u32(bytes, static_cast<std::uint32_t>(bloom.bit_count()));
-  append_u32(bytes, bloom.hash_count());
-  bytes.insert(bytes.end(), bloom.bytes().begin(), bloom.bytes().end());
-  for (const auto& [key, entry] : entries) {
-    append_u64(bytes, entry.sequence);
-    bytes.push_back(entry.tombstone ? 1 : 0);
-    bytes.insert(bytes.end(), 3, 0);
-    append_u32(bytes, static_cast<std::uint32_t>(key.size()));
-    append_u32(bytes, static_cast<std::uint32_t>(entry.value.size()));
-    bytes.insert(bytes.end(), key.begin(), key.end());
-    bytes.insert(bytes.end(), entry.value.begin(), entry.value.end());
-  }
-  append_u32(bytes, crc32(bytes.data(), bytes.size()));
+std::filesystem::path LSMTree::table_path(std::uint64_t generation,
+                                          bool temporary) const {
+  return directory_ / ("sst-" + std::to_string(generation) +
+                       (temporary ? ".dat.tmp" : ".dat"));
+}
 
-  const std::uint64_t generation = next_generation_++;
-  const std::string base = "sst-" + std::to_string(generation) + ".dat";
-  const auto temporary = directory_ / (base + ".tmp");
-  const auto destination = directory_ / base;
-  const int fd = ::open(temporary.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644);
-  if (fd < 0) {
-    system_error("create SSTable");
-  }
-  try {
-    write_all(fd, bytes.data(), bytes.size());
-    if (::fsync(fd) != 0) {
-      system_error("fsync SSTable");
-    }
-  } catch (...) {
-    ::close(fd);
-    throw;
-  }
-  ::close(fd);
+std::shared_ptr<LSMTree::Table> LSMTree::install_table(
+    const std::filesystem::path& temporary, std::uint64_t generation) {
+  const auto destination = table_path(generation, false);
   if (::rename(temporary.c_str(), destination.c_str()) != 0) {
     system_error("rename SSTable");
   }
@@ -659,8 +1080,14 @@ void LSMTree::flush() {
     return;
   }
   require_writable();
-  auto table = write_table(memtable_);
-  tables_.insert(tables_.begin(), std::move(table));
+  const std::uint64_t generation = next_generation_++;
+  const auto temporary = table_path(generation, true);
+  build_table(temporary, options_, memtable_.size(), [&](TableWriter& writer) {
+    for (const auto& [key, entry] : memtable_) {
+      writer.add(key, entry);
+    }
+  });
+  tables_.insert(tables_.begin(), install_table(temporary, generation));
   reset_wal();
   memtable_.clear();
   memtable_size_ = 0;
@@ -674,17 +1101,49 @@ void LSMTree::compact() {
     return;
   }
   require_writable();
-  std::map<std::string, Entry> merged;
+  std::size_t expected_keys = 0;
   for (const auto& table : tables_) {
-    for (const auto& [key, entry] : table->entries) {
-      const auto current = merged.find(key);
-      if (current == merged.end() ||
-          current->second.sequence < entry.sequence) {
-        merged[key] = entry;
+    expected_keys += static_cast<std::size_t>(table->entry_count);
+  }
+  const std::uint64_t generation = next_generation_++;
+  const auto temporary = table_path(generation, true);
+  // Streaming k-way merge: each source contributes one block at a time, and
+  // for every key only the newest version (highest sequence) is written.
+  // Tombstones are kept; see "Why compaction retains tombstones".
+  build_table(temporary, options_, expected_keys, [&](TableWriter& writer) {
+    std::vector<TableCursor> cursors;
+    cursors.reserve(tables_.size());
+    for (const auto& table : tables_) {
+      cursors.emplace_back(*table, nullptr, block_reads_);
+      cursors.back().seek("");
+    }
+    for (;;) {
+      const std::string* smallest = nullptr;
+      for (const auto& cursor : cursors) {
+        if (cursor.valid() && (smallest == nullptr || cursor.key() < *smallest)) {
+          smallest = &cursor.key();
+        }
+      }
+      if (smallest == nullptr) {
+        break;
+      }
+      const std::string key = *smallest;
+      const Entry* newest = nullptr;
+      for (const auto& cursor : cursors) {
+        if (cursor.valid() && cursor.key() == key &&
+            (newest == nullptr || cursor.entry().sequence > newest->sequence)) {
+          newest = &cursor.entry();
+        }
+      }
+      writer.add(key, *newest);
+      for (auto& cursor : cursors) {
+        if (cursor.valid() && cursor.key() == key) {
+          cursor.next();
+        }
       }
     }
-  }
-  auto replacement = write_table(merged);
+  });
+  auto replacement = install_table(temporary, generation);
   const auto old_tables = tables_;
   tables_.assign(1, replacement);
   for (const auto& table : old_tables) {
@@ -729,7 +1188,7 @@ void LSMTree::sync_directory() const {
 
 Stats LSMTree::stats() const {
   return {memtable_.size(), tables_.size(), sequence_, bloom_checks_,
-          bloom_negative_hits_};
+          bloom_negative_hits_, block_reads_, block_cache_->hits};
 }
 
 }  // namespace lsm

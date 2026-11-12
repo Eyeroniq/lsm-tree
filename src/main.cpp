@@ -89,11 +89,15 @@ int verify(const std::filesystem::path& directory,
   return 0;
 }
 
-int benchmark(const std::filesystem::path& directory, std::size_t count) {
+int benchmark(const std::filesystem::path& directory, std::size_t count,
+              std::optional<std::size_t> block_cache_bytes) {
   std::filesystem::remove_all(directory);
   lsm::Options options;
   options.memtable_bytes = 256 * 1024;
   options.compaction_trigger = 4;
+  if (block_cache_bytes) {
+    options.block_cache_bytes = *block_cache_bytes;
+  }
 
   const auto write_started = std::chrono::steady_clock::now();
   {
@@ -128,7 +132,9 @@ int benchmark(const std::filesystem::path& directory, std::size_t count) {
             << " reads=" << count << " read_ops_per_second="
             << count / read_seconds << " found=" << found
             << " sstables=" << stats.sstable_count
-            << " bloom_checks=" << stats.bloom_checks << "\n";
+            << " bloom_checks=" << stats.bloom_checks
+            << " block_reads=" << stats.block_reads
+            << " block_cache_hits=" << stats.block_cache_hits << "\n";
   return found == count ? 0 : 1;
 }
 
@@ -142,18 +148,23 @@ int main(int argc, char** argv) {
     if (argc == 4 && std::string(argv[1]) == "verify") {
       return verify(argv[2], argv[3]);
     }
-    if (argc == 4 && std::string(argv[1]) == "benchmark") {
+    if ((argc == 4 || argc == 5) && std::string(argv[1]) == "benchmark") {
       const std::size_t count = std::stoull(argv[3]);
       if (count == 0) {
         throw std::invalid_argument("operation count must be positive");
       }
-      return benchmark(argv[2], count);
+      std::optional<std::size_t> cache;
+      if (argc == 5) {
+        cache = std::stoull(argv[4]);
+      }
+      return benchmark(argv[2], count, cache);
     }
     std::cerr
         << "usage:\n"
         << "  lsm_tool workload <directory> <oracle>\n"
         << "  lsm_tool verify <directory> <oracle>\n"
-        << "  lsm_tool benchmark <directory> <operation-count>\n";
+        << "  lsm_tool benchmark <directory> <operation-count> "
+           "[block-cache-bytes]\n";
     return 2;
   } catch (const std::exception& error) {
     std::cerr << "error: " << error.what() << "\n";
