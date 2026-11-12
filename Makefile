@@ -68,7 +68,7 @@ POWERCUT_LIB := $(BUILD_DIR)/powercut.so
 POWERCUT_SNAPSHOT := $(BUILD_DIR)/powercut_snapshot
 
 $(POWERCUT_LIB): scripts/powercut/powercut.c | $(BUILD_DIR)
-	$(CC) -O2 -Wall -Wextra -Werror -shared -fPIC $< -o $@ -ldl
+	$(CC) -O2 -Wall -Wextra -Werror -shared -fPIC -pthread $< -o $@ -ldl
 
 $(POWERCUT_SNAPSHOT): scripts/powercut/powercut.c | $(BUILD_DIR)
 	$(CC) -O2 -Wall -Wextra -Werror -DPOWERCUT_MAIN $< -o $@

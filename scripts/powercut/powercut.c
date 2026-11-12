@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,6 +155,11 @@ int fsync(int fd) {
   if (result != 0 || root == NULL || shadow == NULL) {
     return result;
   }
+  /* The engine fsyncs from several threads (writers rotating the WAL, the
+   * background thread flushing), so recording is serialized: two threads
+   * must never share the shadow's temporary files. */
+  static pthread_mutex_t recording = PTHREAD_MUTEX_INITIALIZER;
+  pthread_mutex_lock(&recording);
   const int saved = errno;
   char link[64];
   char path[PATH_MAX];
@@ -194,6 +200,7 @@ int fsync(int fd) {
       kill(getpid(), SIGKILL);
     }
   }
+  pthread_mutex_unlock(&recording);
   errno = saved;
   return result;
 }
