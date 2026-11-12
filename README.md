@@ -272,7 +272,17 @@ Settings bind from `application.properties` or environment variables:
 ```bash
 docker build -t lsm-tree-server .
 docker run -p 8080:8080 -v lsm-data:/data lsm-tree-server
+
+curl -X PUT --data-binary 'Ada' localhost:8080/api/v1/kv/user:1
+curl localhost:8080/api/v1/kv/user:1
+curl 'localhost:8080/api/v1/kv?from=user:&to=user;'
 ```
+
+`make smoke-test` builds the image and drives a real container over HTTP:
+reads, writes, deletes and scans; a graceful restart; a `SIGKILL` after an
+acknowledged write, which must still be readable afterwards; and a second
+container on the same volume, which the `LOCK` file must refuse. CI runs it on
+every push.
 
 ## Repository map
 
