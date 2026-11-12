@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <limits>
 #include <list>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <sys/file.h>
@@ -1346,6 +1347,35 @@ bool overlaps(const Table& table, const std::string& smallest,
 
 }  // namespace
 
+// Sequences of live snapshots. Shared with each Snapshot, so a snapshot that
+// outlives its database stays safe to release.
+struct Snapshot::Registry {
+  bool any() const {
+    std::lock_guard<std::mutex> guard(mutex);
+    return !live.empty();
+  }
+  // The oldest sequence any reader may still read at: the oldest snapshot,
+  // or `latest` when there is none.
+  std::uint64_t smallest(std::uint64_t latest) const {
+    std::lock_guard<std::mutex> guard(mutex);
+    return live.empty() ? latest : *live.begin();
+  }
+
+  mutable std::mutex mutex;
+  std::multiset<std::uint64_t> live;
+};
+
+Snapshot::Snapshot(std::uint64_t sequence, std::shared_ptr<Registry> registry)
+    : sequence_(sequence), registry_(std::move(registry)) {
+  std::lock_guard<std::mutex> guard(registry_->mutex);
+  registry_->live.insert(sequence_);
+}
+
+Snapshot::~Snapshot() {
+  std::lock_guard<std::mutex> guard(registry_->mutex);
+  registry_->live.erase(registry_->live.find(sequence_));
+}
+
 LSMTree::LSMTree(std::filesystem::path directory, Options options)
     : directory_(std::move(directory)),
       wal_path_(directory_ / "active.wal"),
@@ -1357,6 +1387,7 @@ LSMTree::LSMTree(std::filesystem::path directory, Options options)
     throw std::invalid_argument("invalid LSM options");
   }
   block_cache_ = std::make_unique<BlockCache>(options_.block_cache_bytes);
+  snapshots_ = std::make_shared<Snapshot::Registry>();
   std::filesystem::create_directories(directory_);
   acquire_lock();
   try {
@@ -1723,16 +1754,7 @@ void LSMTree::recover_wal() {
         reinterpret_cast<const char*>(record.data() + kWalHeader);
     std::string key(payload, key_length);
     std::string value(payload + key_length, value_length);
-    const Entry entry{sequence, type == 2, std::move(value)};
-    const auto current = memtable_.find(key);
-    if (current == memtable_.end() ||
-        current->second.sequence <= entry.sequence) {
-      if (current != memtable_.end()) {
-        memtable_size_ -= current->first.size() + current->second.value.size();
-      }
-      memtable_size_ += key.size() + entry.value.size();
-      memtable_[std::move(key)] = entry;
-    }
+    insert_memtable(key, Entry{sequence, type == 2, std::move(value)});
     sequence_ = std::max(sequence_, sequence);
     offset += record_size;
   }
@@ -1789,26 +1811,63 @@ void LSMTree::mutate(const std::string& key, const std::string& value,
   wal_size_ += record.size();
   sequence_ = sequence;
 
-  const auto current = memtable_.find(key);
-  if (current != memtable_.end()) {
-    memtable_size_ -= current->first.size() + current->second.value.size();
-  }
-  memtable_[key] = {sequence, tombstone, value};
-  memtable_size_ += key.size() + value.size();
+  insert_memtable(key, Entry{sequence, tombstone, value});
   if (memtable_size_ >= options_.memtable_bytes) {
     flush();
   }
 }
 
+// Adds one version to the memtable. Without live snapshots only the newest
+// version of a key is ever readable, so older ones are replaced in place;
+// while a snapshot exists they are kept, and flush decides which survive.
+void LSMTree::insert_memtable(const std::string& key, Entry entry) {
+  const auto newest =
+      memtable_.lower_bound({key, std::numeric_limits<std::uint64_t>::max()});
+  const bool has_versions = newest != memtable_.end() && newest->first.first == key;
+  if (has_versions && newest->first.second >= entry.sequence) {
+    return;  // Already have this version or a newer one (WAL replay).
+  }
+  if (has_versions && !snapshots_->any()) {
+    auto version = newest;
+    while (version != memtable_.end() && version->first.first == key) {
+      memtable_size_ -= key.size() + version->second.value.size();
+      version = memtable_.erase(version);
+    }
+  }
+  memtable_size_ += key.size() + entry.value.size();
+  const std::uint64_t sequence = entry.sequence;
+  memtable_.emplace(std::make_pair(key, sequence), std::move(entry));
+}
+
+std::shared_ptr<const Snapshot> LSMTree::snapshot() const {
+  return std::shared_ptr<const Snapshot>(new Snapshot(sequence_, snapshots_));
+}
+
+std::uint64_t LSMTree::smallest_snapshot() const {
+  return snapshots_->smallest(sequence_);
+}
+
 std::optional<std::string> LSMTree::get(const std::string& key) const {
-  const auto memory = memtable_.find(key);
-  if (memory != memtable_.end()) {
+  return read(key, sequence_);
+}
+
+std::optional<std::string> LSMTree::get(const std::string& key,
+                                        const Snapshot& snapshot) const {
+  return read(key, snapshot.sequence());
+}
+
+// Returns the newest version of `key` with a sequence no greater than `at`.
+std::optional<std::string> LSMTree::read(const std::string& key,
+                                         std::uint64_t at) const {
+  // Versions of a key sort newest first, so this finds the newest visible.
+  const auto memory = memtable_.lower_bound({key, at});
+  if (memory != memtable_.end() && memory->first.first == key) {
     return memory->second.tombstone
                ? std::nullopt
                : std::optional<std::string>(memory->second.value);
   }
   // Shallower levels hold newer data, and within level 0 newer tables come
-  // first, so the first table that contains the key has its newest version.
+  // first, so the first table with a visible version has the newest one.
   for (std::size_t level = 0; level < levels_.size(); ++level) {
     const auto& tables = levels_[level];
     std::size_t first = 0;
@@ -1835,6 +1894,11 @@ std::optional<std::string> LSMTree::get(const std::string& key) const {
       }
       TableCursor cursor(table, block_cache_.get(), block_reads_);
       cursor.seek(key);
+      // Step past versions newer than the reader may see.
+      while (cursor.valid() && cursor.key() == key &&
+             cursor.entry().sequence > at) {
+        cursor.next();
+      }
       if (cursor.valid() && cursor.key() == key) {
         return cursor.entry().tombstone
                    ? std::nullopt
@@ -1847,10 +1911,31 @@ std::optional<std::string> LSMTree::get(const std::string& key) const {
 
 std::vector<std::pair<std::string, std::string>> LSMTree::scan(
     const std::string& begin, const std::string& end) const {
+  return scan_at(begin, end, sequence_);
+}
+
+std::vector<std::pair<std::string, std::string>> LSMTree::scan(
+    const std::string& begin, const std::string& end,
+    const Snapshot& snapshot) const {
+  return scan_at(begin, end, snapshot.sequence());
+}
+
+std::vector<std::pair<std::string, std::string>> LSMTree::scan_at(
+    const std::string& begin, const std::string& end, std::uint64_t at) const {
   if (end < begin) {
     throw std::invalid_argument("scan end precedes begin");
   }
+  // For each key, the version with the highest sequence not above `at`.
   std::map<std::string, Entry> latest;
+  const auto offer = [&](const std::string& key, const Entry& entry) {
+    if (entry.sequence > at) {
+      return;
+    }
+    const auto current = latest.find(key);
+    if (current == latest.end() || current->second.sequence < entry.sequence) {
+      latest[key] = entry;
+    }
+  };
   for (const auto& tables : levels_) {
     for (const auto& table : tables) {
       if (table->entry_count == 0 || table->largest < begin ||
@@ -1861,23 +1946,16 @@ std::vector<std::pair<std::string, std::string>> LSMTree::scan(
       for (cursor.seek(begin);
            cursor.valid() && (end.empty() || cursor.key() < end);
            cursor.next()) {
-        const auto current = latest.find(cursor.key());
-        if (current == latest.end() ||
-            current->second.sequence < cursor.entry().sequence) {
-          latest[cursor.key()] = cursor.entry();
-        }
+        offer(cursor.key(), cursor.entry());
       }
     }
   }
-  for (auto iterator = memtable_.lower_bound(begin);
+  for (auto iterator = memtable_.lower_bound(
+           {begin, std::numeric_limits<std::uint64_t>::max()});
        iterator != memtable_.end() &&
-       (end.empty() || iterator->first < end);
+       (end.empty() || iterator->first.first < end);
        ++iterator) {
-    const auto current = latest.find(iterator->first);
-    if (current == latest.end() ||
-        current->second.sequence < iterator->second.sequence) {
-      latest[iterator->first] = iterator->second;
-    }
+    offer(iterator->first.first, iterator->second);
   }
   std::vector<std::pair<std::string, std::string>> output;
   output.reserve(latest.size());
@@ -1903,9 +1981,22 @@ void LSMTree::flush() {
   const std::uint64_t generation = next_generation_++;
   const auto temporary = table_path(generation, true);
   const auto destination = table_path(generation, false);
+  const std::uint64_t oldest_reader = smallest_snapshot();
   build_table(temporary, options_, memtable_.size(), [&](TableWriter& writer) {
-    for (const auto& [key, entry] : memtable_) {
-      writer.add(key, entry);
+    const std::string* current = nullptr;
+    std::uint64_t newer = 0;
+    for (const auto& [internal, entry] : memtable_) {
+      if (current == nullptr || internal.first != *current) {
+        current = &internal.first;
+        newer = std::numeric_limits<std::uint64_t>::max();
+      }
+      // A version whose newer version is visible to every reader is hidden
+      // from all of them.
+      const bool hidden = newer <= oldest_reader;
+      newer = internal.second;
+      if (!hidden) {
+        writer.add(internal.first, entry);
+      }
     }
   });
   if (::rename(temporary.c_str(), destination.c_str()) != 0) {
@@ -1913,7 +2004,7 @@ void LSMTree::flush() {
   }
   sync_directory();
   auto table = load_table(destination);
-  table->smallest = memtable_.begin()->first;
+  table->smallest = memtable_.begin()->first.first;
   Levels next = levels_;
   next[0].insert(next[0].begin(), std::move(table));
   // The table is live once the MANIFEST lists it; only then may the WAL that
@@ -2119,44 +2210,65 @@ void LSMTree::run_compaction(const std::vector<std::shared_ptr<Table>>& inputs,
       cursors.emplace_back(*table, nullptr, block_reads_);
       cursors.back().seek("");
     }
+    const std::uint64_t oldest_reader = smallest_snapshot();
+    std::string current_key;
+    bool have_key = false;
+    std::uint64_t newer = 0;  // Sequence of the previous version of the key.
     for (;;) {
-      const std::string* smallest = nullptr;
-      for (const auto& cursor : cursors) {
+      // The next entry in (key ascending, sequence descending) order.
+      TableCursor* next = nullptr;
+      for (auto& cursor : cursors) {
         if (cursor.valid() &&
-            (smallest == nullptr || cursor.key() < *smallest)) {
-          smallest = &cursor.key();
+            (next == nullptr || cursor.key() < next->key() ||
+             (cursor.key() == next->key() &&
+              cursor.entry().sequence > next->entry().sequence))) {
+          next = &cursor;
         }
       }
-      if (smallest == nullptr) {
+      if (next == nullptr) {
         break;
       }
-      const std::string key = *smallest;
-      const Entry* newest = nullptr;
-      for (const auto& cursor : cursors) {
-        if (cursor.valid() && cursor.key() == key &&
-            (newest == nullptr || cursor.entry().sequence > newest->sequence)) {
-          newest = &cursor.entry();
-        }
-      }
-      if (!(newest->tombstone && is_base_level(output_level, key))) {
-        if (!writer) {
-          const std::uint64_t generation = next_generation_++;
-          outputs.push_back({generation, table_path(generation, true), key, key});
-          writer = std::make_unique<TableWriter>(
-              outputs.back().temporary, options_.block_bytes,
-              options_.bloom_bits_per_key, keys_per_output);
-        }
-        writer->add(key, *newest);
-        outputs.back().largest = key;
-        if (writer->bytes_written() >= options_.table_bytes) {
-          finish_output();
-        }
-      }
+      const std::string key = next->key();
+      const Entry entry = next->entry();
+      // Advance every input at this exact version. Two inputs can hold the
+      // same version after a crash between a flush and its WAL reset.
       for (auto& cursor : cursors) {
-        if (cursor.valid() && cursor.key() == key) {
+        if (cursor.valid() && cursor.key() == key &&
+            cursor.entry().sequence == entry.sequence) {
           cursor.next();
         }
       }
+      if (!have_key || key != current_key) {
+        current_key = key;
+        have_key = true;
+        newer = std::numeric_limits<std::uint64_t>::max();
+      }
+      // Hidden: a newer version of the key is visible to every reader.
+      // Collectable tombstone: no reader predates it and nothing below the
+      // output level can hold an older version for it to hide.
+      const bool hidden = newer <= oldest_reader;
+      const bool collectable = entry.tombstone &&
+                               entry.sequence <= oldest_reader &&
+                               is_base_level(output_level, key);
+      newer = entry.sequence;
+      if (hidden || collectable) {
+        continue;
+      }
+      // Split outputs only between keys, so no two tables in a level share
+      // a key.
+      if (writer && key != outputs.back().largest &&
+          writer->bytes_written() >= options_.table_bytes) {
+        finish_output();
+      }
+      if (!writer) {
+        const std::uint64_t generation = next_generation_++;
+        outputs.push_back({generation, table_path(generation, true), key, key});
+        writer = std::make_unique<TableWriter>(
+            outputs.back().temporary, options_.block_bytes,
+            options_.bloom_bits_per_key, keys_per_output);
+      }
+      writer->add(key, entry);
+      outputs.back().largest = key;
     }
     if (writer) {
       finish_output();

@@ -1093,6 +1093,155 @@ void test_restart_points_find_every_key() {
   reset(directory);
 }
 
+void test_snapshot_sees_a_frozen_view() {
+  const auto directory = test_directory("snapshot");
+  reset(directory);
+  lsm::Options options;
+  options.compaction_trigger = 10;
+  lsm::LSMTree database(directory, options);
+  database.put("a", "1");
+  database.put("b", "1");
+  const auto snapshot = database.snapshot();
+  database.put("a", "2");
+  database.erase("b");
+  database.put("c", "3");
+  const std::vector<std::pair<std::string, std::string>> then = {{"a", "1"},
+                                                                 {"b", "1"}};
+  std::vector<std::pair<std::string, std::string>> now = {{"a", "2"},
+                                                          {"c", "3"}};
+  // In the memtable, after a flush, and after full compactions, the
+  // snapshot sees the old view and plain reads see the new one.
+  for (int stage = 0; stage < 3; ++stage) {
+    CHECK(database.get("a", *snapshot) == std::optional<std::string>("1"));
+    CHECK(database.get("b", *snapshot) == std::optional<std::string>("1"));
+    CHECK(!database.get("c", *snapshot));
+    CHECK(database.scan("", "", *snapshot) == then);
+    CHECK(database.get("a") == std::optional<std::string>("2"));
+    CHECK(!database.get("b"));
+    CHECK(database.scan("", "") == now);
+    if (stage == 0) {
+      database.flush();
+    } else {
+      database.put("d", std::to_string(stage));
+      if (now.size() == 2) {
+        now.emplace_back("d", "");
+      }
+      now.back().second = std::to_string(stage);
+      database.flush();
+      database.compact();
+    }
+  }
+  reset(directory);
+}
+
+void test_released_snapshot_lets_versions_go() {
+  const auto directory = test_directory("snapshot-gc");
+  reset(directory);
+  lsm::Options options;
+  options.memtable_bytes = 1 << 20;
+  options.compaction_trigger = 10;
+  const std::string big(1000, 'x');
+  lsm::LSMTree database(directory, options);
+  database.put("k", "original");
+  database.put("other", "o");
+  auto snapshot = database.snapshot();
+  for (int version = 0; version < 100; ++version) {
+    database.put("k", big + std::to_string(version));
+  }
+  database.flush();
+  database.put("other", "o2");
+  database.flush();
+  database.compact();
+  // Every version newer than the snapshot is kept while it lives, because
+  // the newest version is not visible to it.
+  std::uintmax_t held = 0;
+  for (const auto& file : table_files(directory)) {
+    held += std::filesystem::file_size(file);
+  }
+  CHECK(held > 50 * big.size());
+  CHECK(database.get("k", *snapshot) == std::optional<std::string>("original"));
+  snapshot.reset();
+  database.put("other", "o3");
+  database.flush();
+  database.compact();
+  std::uintmax_t released = 0;
+  for (const auto& file : table_files(directory)) {
+    released += std::filesystem::file_size(file);
+  }
+  // Once no snapshot can see them, only the newest version remains.
+  CHECK(released < 3 * big.size());
+  CHECK(database.get("k") == std::optional<std::string>(big + "99"));
+  reset(directory);
+}
+
+void test_snapshot_survives_leveled_compaction() {
+  const auto directory = test_directory("snapshot-levels");
+  reset(directory);
+  auto options = small_options();
+  options.sync_writes = false;
+  std::mt19937 random(777);
+  std::map<std::string, std::optional<std::string>> then;
+  std::map<std::string, std::optional<std::string>> now;
+  lsm::LSMTree database(directory, options);
+  for (int step = 0; step < 800; ++step) {
+    const std::string key = numbered("snap-", static_cast<int>(random() % 300));
+    const std::string value = "a" + std::to_string(random() % 1000);
+    database.put(key, value);
+    now[key] = value;
+  }
+  then = now;
+  const auto snapshot = database.snapshot();
+  for (int step = 0; step < 4000; ++step) {
+    const std::string key = numbered("snap-", static_cast<int>(random() % 300));
+    if (random() % 4 == 0) {
+      database.erase(key);
+      now[key] = std::nullopt;
+    } else {
+      const std::string value = "b" + std::to_string(random() % 1000);
+      database.put(key, value);
+      now[key] = value;
+    }
+  }
+  CHECK(deepest_level(database.stats()) >= 2);
+  std::vector<std::pair<std::string, std::string>> expected_then;
+  for (const auto& [key, value] : then) {
+    CHECK(database.get(key, *snapshot) == value);
+    if (value) {
+      expected_then.emplace_back(key, *value);
+    }
+  }
+  for (const auto& [key, value] : now) {
+    CHECK(database.get(key) == value);
+  }
+  CHECK(database.scan("", "", *snapshot) == expected_then);
+  reset(directory);
+}
+
+void test_tombstone_kept_while_snapshot_needs_old_value() {
+  const auto directory = test_directory("snapshot-tombstone");
+  reset(directory);
+  lsm::Options options;
+  options.compaction_trigger = 10;
+  lsm::LSMTree database(directory, options);
+  database.put("k", "v");
+  database.flush();
+  {
+    const auto snapshot = database.snapshot();
+    database.erase("k");
+    database.flush();
+    database.compact();
+    CHECK(!database.get("k"));
+    CHECK(database.get("k", *snapshot) == std::optional<std::string>("v"));
+  }
+  // Released: the tombstone and the value it hid can both go.
+  database.put("z", "1");
+  database.flush();
+  database.compact();
+  CHECK(!database.get("k"));
+  CHECK(database.scan("", "").size() == 1);
+  reset(directory);
+}
+
 }  // namespace
 
 int main() {
@@ -1125,6 +1274,10 @@ int main() {
   test_version2_table_is_read_and_migrated();
   test_prefix_compression_shrinks_tables();
   test_restart_points_find_every_key();
+  test_snapshot_sees_a_frozen_view();
+  test_released_snapshot_lets_versions_go();
+  test_snapshot_survives_leveled_compaction();
+  test_tombstone_kept_while_snapshot_needs_old_value();
   if (failures != 0) {
     std::cerr << failures << " of " << assertions << " assertions failed\n";
     return 1;

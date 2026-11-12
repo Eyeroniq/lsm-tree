@@ -47,6 +47,30 @@ struct Stats {
   std::vector<std::size_t> tables_per_level;
 };
 
+class LSMTree;
+
+// A consistent point-in-time view. Reads through a snapshot see exactly the
+// writes acknowledged before it was taken, however much is written,
+// flushed or compacted afterwards. Versions it can see are kept until it is
+// released (destroyed).
+class Snapshot {
+ public:
+  Snapshot(const Snapshot&) = delete;
+  Snapshot& operator=(const Snapshot&) = delete;
+  ~Snapshot();
+
+  // Sequence number of the last write the snapshot sees.
+  std::uint64_t sequence() const { return sequence_; }
+
+ private:
+  friend class LSMTree;
+  struct Registry;
+  Snapshot(std::uint64_t sequence, std::shared_ptr<Registry> registry);
+
+  std::uint64_t sequence_;
+  std::shared_ptr<Registry> registry_;
+};
+
 class LSMTree {
  public:
   struct Entry;
@@ -66,6 +90,13 @@ class LSMTree {
   std::vector<std::pair<std::string, std::string>> scan(
       const std::string& begin, const std::string& end) const;
 
+  std::shared_ptr<const Snapshot> snapshot() const;
+  std::optional<std::string> get(const std::string& key,
+                                 const Snapshot& snapshot) const;
+  std::vector<std::pair<std::string, std::string>> scan(
+      const std::string& begin, const std::string& end,
+      const Snapshot& snapshot) const;
+
   void flush();
   void compact();
   Stats stats() const;
@@ -75,8 +106,24 @@ class LSMTree {
   // tables with disjoint key ranges, sorted by smallest key.
   using Levels = std::vector<std::vector<std::shared_ptr<Table>>>;
 
+  // Memtable keys are (key, sequence), ordered by key and then newest first.
+  struct VersionOrder {
+    bool operator()(const std::pair<std::string, std::uint64_t>& left,
+                    const std::pair<std::string, std::uint64_t>& right) const {
+      return left.first < right.first ||
+             (left.first == right.first && left.second > right.second);
+    }
+  };
+
   void mutate(const std::string& key, const std::string& value,
               bool tombstone);
+  void insert_memtable(const std::string& key, Entry entry);
+  std::optional<std::string> read(const std::string& key,
+                                  std::uint64_t at) const;
+  std::vector<std::pair<std::string, std::string>> scan_at(
+      const std::string& begin, const std::string& end,
+      std::uint64_t at) const;
+  std::uint64_t smallest_snapshot() const;
   void acquire_lock();
   void open_tables();
   void commit(Levels next);
@@ -114,7 +161,9 @@ class LSMTree {
   std::uint64_t sequence_ = 0;
   std::uint64_t next_generation_ = 1;
   std::size_t memtable_size_ = 0;
-  std::map<std::string, Entry> memtable_;
+  std::map<std::pair<std::string, std::uint64_t>, Entry, VersionOrder>
+      memtable_;
+  std::shared_ptr<Snapshot::Registry> snapshots_;
   Levels levels_;
   // Per level, the largest key of the last table compacted from it, so that
   // successive compactions walk the key space round-robin.
