@@ -21,8 +21,14 @@ first principles.
 - Bloom filters reject absent keys before table lookup;
 - newest-version-wins reads span memory and multiple disk generations;
 - ordered range scans reconcile versions and tombstones across every layer;
-- tombstones prevent deleted values from resurfacing;
-- compaction durably installs a replacement before deleting old generations;
+- tombstones prevent deleted values from resurfacing, and are dropped once
+  compaction proves no older version can lie beneath them;
+- leveled compaction: level 0 holds fresh flushes, and each deeper level holds
+  disjoint ~2 MB tables in a budget 10x the level above, so compaction
+  rewrites only the tables whose ranges overlap;
+- a checksummed `MANIFEST` records which tables are live and at which level;
+  flushes and compactions commit by atomically replacing it, before any input
+  is deleted;
 - incomplete WAL tails are detected and repaired to the verified record
   boundary;
 - SSTable corruption is rejected instead of silently returning suspect data;
@@ -36,22 +42,22 @@ flowchart LR
   W["put / erase"] --> L["CRC32 WAL record"]
   L --> S["fsync + acknowledge"]
   S --> M["ordered memtable"]
-  M -->|size threshold| T["immutable SSTable"]
-  T --> B["Bloom filter"]
-  T --> C["newest-first compaction"]
+  M -->|size threshold| T["level 0 SSTable"]
+  T --> F["MANIFEST commit"]
+  F --> C["leveled compaction: L0 to L6"]
   R["get"] --> M
-  R --> B
+  R --> B["Bloom filter"]
   B -->|maybe present| T
-  B -->|definitely absent| N["next generation"]
+  B -->|definitely absent| N["next table or level"]
 ```
 
 ## Measured, not implied
 
 | Check | Result |
 |---|---:|
-| Correctness assertions | **4,311 passed** |
+| Correctness assertions | **5,523 passed** |
 | Seeded differential operations | 2,000 across five restarts |
-| Randomized hard-crash rounds | 100 |
+| Randomized hard-crash rounds | 2,000 (two seeds), up to 141 live tables |
 | Independently acknowledged writes lost | **0** |
 | Benchmark records recovered | 20,000 / 20,000 |
 
@@ -68,8 +74,20 @@ The benchmark data (about 1 MB) fits in the cache, so the cached row is the
 hot-set case; the uncached row is the floor when every read misses. Write
 throughput is bound by `fsync` on WSL's virtual disk and varies by about
 ±20% between runs, so the write column shows no real difference. The same benchmark on
-an Apple M2 Pro measured 34,708 writes/s with the previous format. These are
-local measurements, not universal hardware claims.
+an Apple M2 Pro measured 34,708 writes/s with the previous format.
+
+Write amplification, loading random keys with 100-byte values and `fsync`
+off, measured as bytes the process wrote per byte of user data:
+
+| Keys loaded | Full compaction (before) | Leveled compaction | Load time |
+|---|---:|---:|---:|
+| 100,000 (11 MB) | 27x | 22x | 1.6 s to 1.4 s |
+| 300,000 (33 MB) | 77x | **35x** | 14.0 s to **6.8 s** |
+
+Full compaction rewrites the whole database every few flushes, so its cost
+grows with the database; leveled compaction rewrites only overlapping
+tables, and the gap widens as data grows. These are local measurements, not
+universal hardware claims.
 
 ## Verify it
 
@@ -79,10 +97,12 @@ make crash-test
 make benchmark
 ```
 
-The crash campaign deliberately splits WAL and SSTable writes into seven-byte
-chunks, kills the writer with uncatchable `SIGKILL` at seeded random times, and
-compares every recovered state with a separately synced acknowledgement
-oracle.
+The crash campaign deliberately splits WAL, SSTable and `MANIFEST` writes
+into seven-byte chunks, kills the writer with uncatchable `SIGKILL` at seeded
+random times, and compares every recovered state with a separately synced
+acknowledgement oracle. Half the rounds run long enough for flushes and
+compactions to be in flight when the kill lands, and the campaign fails if it
+never observes an SSTable, so it cannot quietly degrade into a WAL-only test.
 
 ```bash
 CRASH_ROUNDS=1000 make crash-test
@@ -93,6 +113,11 @@ CRASH_ROUNDS=1000 make crash-test
 ```text
 active.wal
   [magic | sequence | put/delete | key_len | value_len | payload | CRC32]...
+
+MANIFEST
+  [magic | version | next_generation | table_count]
+  [generation | level | smallest_key | largest_key]...
+  [CRC32]
 
 sst-N.dat (version 2, written by this release)
   [magic | version]
@@ -113,7 +138,9 @@ sst-N.dat (version 1, still readable)
 ```
 
 Version 1 tables are loaded whole, as before. The next compaction rewrites
-them as version 2, so existing databases migrate without a separate step.
+them as version 2, so existing databases migrate without a separate step. A
+directory without a `MANIFEST` is from before levels existed: on open, every
+table becomes level 0 in generation order and a `MANIFEST` is written.
 
 Flush ordering is deliberate: write temporary table → `fsync` table → atomic
 rename → `fsync` directory → reset WAL. Compaction follows the same
@@ -123,11 +150,11 @@ cannot expose an older value.
 ## Honest boundary
 
 This is a compact educational engine, not a RocksDB replacement. It currently
-has one writer, keeps one index key per data block in memory, uses
-size-triggered full compaction (now streamed block by block, but still
-rewriting every table), and does not implement snapshots or concurrent
-readers. The tests
-focus on the invariants those future features must preserve.
+has one writer, runs compaction inline on the writing thread, rewrites the
+whole `MANIFEST` on every flush and compaction (cheap at hundreds of tables,
+linear in their number), and does not implement snapshots or concurrent
+readers. The tests focus on the invariants those future features must
+preserve.
 
 No database, serialization library, checksum package, Bloom-filter package, or
 test framework is hidden behind the implementation. The optional HTTP service
@@ -148,16 +175,23 @@ put(key, value)
 flush()
   4. write sst-N.dat.tmp in key order
   5. fsync temporary SSTable
-  6. rename to sst-N.dat
-  7. fsync database directory          <-- table name is now durable
+  6. rename to sst-N.dat, fsync directory
+  7. write MANIFEST.tmp listing the table, fsync,
+     rename to MANIFEST, fsync directory  <-- table is now live
   8. truncate + fsync active.wal
 ```
 
 A crash before step 2 means the operation was never acknowledged. A crash
-between 2 and 7 replays it from the WAL. A crash between 7 and 8 may leave the
-same sequence in both places, which is harmless because sequence numbers make
-replay idempotent. Only after the table and its directory entry are durable is
-the old log discarded.
+between 2 and 7 replays it from the WAL; a table renamed in step 6 but not
+yet in the `MANIFEST` is an orphan and is deleted on open. A crash between 7
+and 8 may leave the same sequence in both places, which is harmless because
+sequence numbers make replay idempotent. Only after the `MANIFEST` naming the
+table is durable is the old log discarded.
+
+Compaction follows the same rule: outputs are written, synced and renamed,
+then one `MANIFEST` replacement swaps outputs in and inputs out, and only then
+are the input files deleted. Before the swap the inputs are live; after it the
+outputs are. There is no instant where both or neither count.
 
 This is why the code uses POSIX file descriptors instead of `ofstream` for the
 durability path. Flushing a C++ stream moves bytes to the kernel; it does not
@@ -216,20 +250,33 @@ The test fixture updates one key in memory, deletes a second over an older
 SSTable, scans before and after flush, reopens the database, compacts it, and
 requires the same result at every stage.
 
-## Why compaction retains tombstones
+## Levels, and when a tombstone may go
 
-The engine writes a complete replacement generation and syncs it before
-deleting sources. During a crash, replacement and sources may coexist.
-Dropping a tombstone from the replacement would make lookup miss there, fall
-through to an old source table, and resurrect the deleted value.
+Level 0 holds tables exactly as flushed; they may overlap, and newer ones
+shadow older ones. Every deeper level holds tables with disjoint key ranges,
+and each level holds older data than the one above it. A point read checks
+the memtable, each level 0 table newest first, then at most one table per
+deeper level, found by binary search on key ranges.
 
-Retaining tombstones makes the overlap safe. Reclaiming them requires stronger
-metadata proving that no older overlapping table contains the key. This engine
-does not pretend to have that proof.
+When level 0 reaches `compaction_trigger` tables, all of them merge with the
+level 1 tables their combined range touches. When a deeper level exceeds its
+byte budget, one of its tables (chosen round-robin through the key space)
+merges with the overlapping tables one level down. If nothing overlaps, the
+table moves down by a `MANIFEST` update alone, without being rewritten.
+
+A tombstone must survive for as long as an older version of its key could
+exist below it. Compaction drops a tombstone only when no table in any level
+below the output overlaps the key. This was unsafe before the `MANIFEST`:
+replacement and source tables could both be on disk after a crash, and a
+lookup that missed the tombstone in the replacement would fall through to a
+source and resurrect the value. With the `MANIFEST`, a replacement and its
+sources are never live at the same time, so the proof exists and the
+tombstone can go. `compact()` merges everything into the deepest level, so
+it drops every tombstone along with the versions they hid.
 
 ## Verification strategy
 
-The 4,311 assertions include:
+The 5,523 assertions include:
 
 - values, overwrites and deletes across process reopen;
 - newest-version-wins reads across multiple SSTables;
@@ -251,8 +298,16 @@ The 4,311 assertions include:
   compaction;
 - 2,000 seeded random mutations checked against `std::map` through five
   reopen cycles;
-- automatic flush and compaction under a 90-byte memtable limit and 64-byte
-  blocks, so cursors cross block boundaries constantly.
+- automatic flush and compaction under a 90-byte memtable limit, 64-byte
+  blocks, 256-byte tables and a 512-byte level 1, so data moves through
+  every level and cursors cross block boundaries constantly;
+- 3,000 random writes and deletes that push data to level 3 or deeper,
+  checked against `std::map`, then reopened with the same level shape;
+- a table renamed into place but missing from the `MANIFEST` is ignored and
+  deleted, even though it has the newest generation;
+- a directory without a `MANIFEST` is migrated to level 0;
+- a damaged `MANIFEST`, or one naming a missing table, fails open;
+- a fully deleted key leaves no table behind after `compact()`.
 
 The crash harness is deliberately external. A Python parent launches a writer,
 enables seven-byte physical writes, waits a seeded random interval, sends
@@ -269,7 +324,10 @@ interval as ambiguous success, never as loss.
 lsm::Options options;
 options.memtable_bytes = 64 * 1024;
 options.bloom_bits_per_key = 10;
-options.compaction_trigger = 4;
+options.compaction_trigger = 4;            // level 0 tables before compacting
+options.table_bytes = 2 * 1024 * 1024;     // target size of compacted tables
+options.level1_bytes = 10 * 1024 * 1024;   // level 1 budget
+options.level_multiplier = 10;             // each level 10x the one above
 options.block_bytes = 4096;
 options.block_cache_bytes = 8 * 1024 * 1024;
 
@@ -352,11 +410,9 @@ Dockerfile               engine library + service in one image
 
 - restart points inside blocks, so a lookup can binary-search a block instead
   of decoding all of it;
-- leveled or size-tiered compaction instead of full-table merging;
-- manifest/version sets for atomic table membership;
+- an append-only `MANIFEST` log of edits instead of rewriting it whole;
 - snapshots and concurrent readers;
 - background flush/compaction;
-- prefix compression and restart points;
-- tombstone collection once lower-level overlap is provably absent.
+- prefix compression.
 
 Each changes the recovery proof. They are listed rather than implied.

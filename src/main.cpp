@@ -49,6 +49,12 @@ int workload(const std::filesystem::path& directory,
   lsm::Options options;
   options.memtable_bytes = 512;
   options.compaction_trigger = 3;
+  // Small tables and levels so kills land inside multi-level compactions
+  // and MANIFEST updates, not only flushes.
+  options.block_bytes = 256;
+  options.table_bytes = 1024;
+  options.level1_bytes = 2048;
+  options.level_multiplier = 2;
   lsm::LSMTree database(directory, options);
   for (;;) {
     const std::uint64_t id = database.stats().sequence + 1;
@@ -65,6 +71,12 @@ int verify(const std::filesystem::path& directory,
   lsm::Options options;
   options.memtable_bytes = 512;
   options.compaction_trigger = 3;
+  // Small tables and levels so kills land inside multi-level compactions
+  // and MANIFEST updates, not only flushes.
+  options.block_bytes = 256;
+  options.table_bytes = 1024;
+  options.level1_bytes = 2048;
+  options.level_multiplier = 2;
   lsm::LSMTree database(directory, options);
   std::ifstream input(oracle);
   std::string line;

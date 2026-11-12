@@ -14,7 +14,15 @@ namespace lsm {
 struct Options {
   std::size_t memtable_bytes = 64 * 1024;
   std::size_t bloom_bits_per_key = 10;
+  // Number of freshly flushed (level 0) tables that triggers a compaction
+  // into level 1.
   std::size_t compaction_trigger = 4;
+  // Leveled compaction: level 1 may hold level1_bytes, and each deeper level
+  // level_multiplier times more. Compaction output is split into tables of
+  // about table_bytes.
+  std::size_t table_bytes = 2 * 1024 * 1024;
+  std::size_t level1_bytes = 10 * 1024 * 1024;
+  std::size_t level_multiplier = 10;
   // Target size of an SSTable data block. Only one key per block is kept in
   // memory; a point read loads a single block from disk.
   std::size_t block_bytes = 4096;
@@ -33,6 +41,10 @@ struct Stats {
   std::uint64_t block_reads = 0;
   // Block lookups served from the block cache instead of disk.
   std::uint64_t block_cache_hits = 0;
+  // Bytes of SSTable written by compaction since open (write amplification).
+  std::uint64_t compaction_bytes_written = 0;
+  // Number of tables in each level, level 0 first.
+  std::vector<std::size_t> tables_per_level;
 };
 
 class LSMTree {
@@ -59,15 +71,25 @@ class LSMTree {
   Stats stats() const;
 
  private:
+  // levels[0] holds overlapping tables, newest first; deeper levels hold
+  // tables with disjoint key ranges, sorted by smallest key.
+  using Levels = std::vector<std::vector<std::shared_ptr<Table>>>;
+
   void mutate(const std::string& key, const std::string& value,
               bool tombstone);
   void acquire_lock();
-  void discover_tables();
+  void open_tables();
+  void write_manifest(const Levels& levels);
   void recover_wal();
   std::filesystem::path table_path(std::uint64_t generation,
                                    bool temporary) const;
-  std::shared_ptr<Table> install_table(const std::filesystem::path& temporary,
-                                       std::uint64_t generation);
+  void maybe_compact();
+  void compact_level0();
+  void compact_level(std::size_t level);
+  void run_compaction(const std::vector<std::shared_ptr<Table>>& inputs,
+                      std::size_t output_level);
+  bool is_base_level(std::size_t level, const std::string& key) const;
+  std::uint64_t level_limit(std::size_t level) const;
   void reset_wal();
   void sync_directory() const;
   void require_writable() const;
@@ -87,7 +109,11 @@ class LSMTree {
   std::uint64_t next_generation_ = 1;
   std::size_t memtable_size_ = 0;
   std::map<std::string, Entry> memtable_;
-  std::vector<std::shared_ptr<Table>> tables_;
+  Levels levels_;
+  // Per level, the largest key of the last table compacted from it, so that
+  // successive compactions walk the key space round-robin.
+  std::vector<std::string> compact_pointer_;
+  std::uint64_t compaction_bytes_written_ = 0;
   mutable std::uint64_t bloom_checks_ = 0;
   mutable std::uint64_t bloom_negative_hits_ = 0;
   mutable std::uint64_t block_reads_ = 0;
