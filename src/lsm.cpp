@@ -800,8 +800,26 @@ void build_table(const std::filesystem::path& path, const Options& options,
   }
 }
 
-constexpr std::uint32_t kManifestMagic = 0x314E414DU;  // MAN1
-constexpr std::uint32_t kManifestVersion = 1;
+// MANIFEST version 2 is a log: [magic | version] then records
+//   [payload_len u32 | type u8 | payload | CRC32 of type + payload]
+// The first record is always a full snapshot; later records are edits.
+//   snapshot payload: [next_generation u64 | count u32 | entry...]
+//   edit payload:     [next_generation u64 | removed u32 | generation u64... |
+//                      added u32 | entry...]
+//   entry:            [generation u64 | level u32 | smallest_len u32 |
+//                      smallest | largest_len u32 | largest]
+// A commit appends one edit and fsyncs. When the log has grown well past its
+// snapshot it is rewritten as a single snapshot (tmp, fsync, rename, fsync
+// directory). Version 1 (MAN1) was one snapshot with a trailing CRC; it is
+// read and rewritten as version 2.
+constexpr std::uint32_t kManifestMagicV1 = 0x314E414DU;  // MAN1
+constexpr std::uint32_t kManifestMagic = 0x324E414DU;    // MAN2
+constexpr std::uint32_t kManifestVersion = 2;
+constexpr std::size_t kManifestHeader = 8;
+constexpr std::size_t kManifestRecordHeader = 5;
+constexpr std::uint8_t kManifestSnapshot = 1;
+constexpr std::uint8_t kManifestEdit = 2;
+constexpr std::uint64_t kManifestRewriteBytes = 64 * 1024;
 constexpr std::size_t kMaxLevels = 7;
 
 struct ManifestTable {
@@ -813,12 +831,105 @@ struct ManifestTable {
 
 struct Manifest {
   std::uint64_t next_generation = 1;
-  std::vector<ManifestTable> tables;
+  std::map<std::uint64_t, ManifestTable> tables;
+  // Old format or an uncommitted (torn) final edit: rewrite on open.
+  bool needs_rewrite = false;
+  std::uint64_t snapshot_bytes = 0;
 };
 
-// MANIFEST: [magic | version | next_generation u64 | count u32 |
-//            (generation u64 | level u32 | smallest_len u32 | smallest |
-//             largest_len u32 | largest)... | CRC32]
+// Bounds-checked reader over one MANIFEST payload.
+struct ManifestReader {
+  const std::uint8_t* data;
+  std::size_t size;
+  std::size_t position = 0;
+
+  void need(std::size_t count) const {
+    if (size - position < count) {
+      throw std::runtime_error("truncated MANIFEST record");
+    }
+  }
+  std::uint32_t u32() {
+    need(4);
+    const std::uint32_t value = read_u32(data + position);
+    position += 4;
+    return value;
+  }
+  std::uint64_t u64() {
+    need(8);
+    const std::uint64_t value = read_u64(data + position);
+    position += 8;
+    return value;
+  }
+  std::string key() {
+    const std::uint32_t length = u32();
+    if (length > kMaxKey) {
+      throw std::runtime_error("invalid MANIFEST key length");
+    }
+    need(length);
+    std::string value(reinterpret_cast<const char*>(data + position), length);
+    position += length;
+    return value;
+  }
+  ManifestTable entry() {
+    ManifestTable table;
+    table.generation = u64();
+    table.level = u32();
+    table.smallest = key();
+    table.largest = key();
+    if (table.generation == 0 || table.level >= kMaxLevels) {
+      throw std::runtime_error("invalid MANIFEST table entry");
+    }
+    return table;
+  }
+};
+
+void append_manifest_entry(std::vector<std::uint8_t>& out,
+                           std::uint64_t generation, std::size_t level,
+                           const std::string& smallest,
+                           const std::string& largest) {
+  append_u64(out, generation);
+  append_u32(out, static_cast<std::uint32_t>(level));
+  append_u32(out, static_cast<std::uint32_t>(smallest.size()));
+  out.insert(out.end(), smallest.begin(), smallest.end());
+  append_u32(out, static_cast<std::uint32_t>(largest.size()));
+  out.insert(out.end(), largest.begin(), largest.end());
+}
+
+std::vector<std::uint8_t> manifest_record(std::uint8_t type,
+                                          const std::vector<std::uint8_t>& payload) {
+  std::vector<std::uint8_t> record;
+  append_u32(record, static_cast<std::uint32_t>(payload.size()));
+  record.push_back(type);
+  record.insert(record.end(), payload.begin(), payload.end());
+  append_u32(record, crc32(record.data() + 4, 1 + payload.size()));
+  return record;
+}
+
+Manifest read_manifest_v1(const std::vector<std::uint8_t>& bytes) {
+  const std::size_t limit = bytes.size() - kChecksum;
+  if (crc32(bytes.data(), limit) != read_u32(bytes.data() + limit)) {
+    throw std::runtime_error("MANIFEST checksum mismatch");
+  }
+  if (read_u32(bytes.data() + 4) != 1) {
+    throw std::runtime_error("unsupported MANIFEST header");
+  }
+  ManifestReader reader{bytes.data(), limit, 8};
+  Manifest manifest;
+  manifest.next_generation = reader.u64();
+  const std::uint32_t count = reader.u32();
+  for (std::uint32_t index = 0; index < count; ++index) {
+    ManifestTable table = reader.entry();
+    if (!manifest.tables.emplace(table.generation, table).second) {
+      throw std::runtime_error("MANIFEST lists a table twice");
+    }
+  }
+  if (reader.position != limit) {
+    throw std::runtime_error("unexpected bytes after MANIFEST entries");
+  }
+  manifest.needs_rewrite = true;
+  return manifest;
+}
+
 // Returns nullopt when the file does not exist, which means the directory
 // predates levels: every table in it is then treated as level 0.
 std::optional<Manifest> read_manifest(const std::filesystem::path& path) {
@@ -845,50 +956,87 @@ std::optional<Manifest> read_manifest(const std::filesystem::path& path) {
   }
   ::close(fd);
 
-  if (bytes.size() < 24) {
+  if (bytes.size() < kManifestHeader + kChecksum) {
     throw std::runtime_error("MANIFEST is too small");
   }
-  const std::size_t limit = bytes.size() - kChecksum;
-  if (crc32(bytes.data(), limit) != read_u32(bytes.data() + limit)) {
-    throw std::runtime_error("MANIFEST checksum mismatch");
+  if (read_u32(bytes.data()) == kManifestMagicV1) {
+    return read_manifest_v1(bytes);
   }
   if (read_u32(bytes.data()) != kManifestMagic ||
       read_u32(bytes.data() + 4) != kManifestVersion) {
     throw std::runtime_error("unsupported MANIFEST header");
   }
+
   Manifest manifest;
-  manifest.next_generation = read_u64(bytes.data() + 8);
-  const std::uint32_t count = read_u32(bytes.data() + 16);
-  std::size_t position = 20;
-  const auto take_key = [&](std::string& out) {
-    if (limit - position < 4) {
-      throw std::runtime_error("truncated MANIFEST");
+  const std::size_t size = bytes.size();
+  std::size_t position = kManifestHeader;
+  bool first = true;
+  while (position < size) {
+    // An append cut short by a crash leaves an incomplete final record: that
+    // edit was never committed. The first record was written whole (tmp file,
+    // rename), so damage there is corruption.
+    if (size - position < kManifestRecordHeader + kChecksum ||
+        read_u32(bytes.data() + position) >
+            size - position - kManifestRecordHeader - kChecksum) {
+      if (first) {
+        throw std::runtime_error("MANIFEST snapshot is truncated");
+      }
+      manifest.needs_rewrite = true;
+      break;
     }
     const std::uint32_t length = read_u32(bytes.data() + position);
-    position += 4;
-    if (length > kMaxKey || limit - position < length) {
-      throw std::runtime_error("invalid MANIFEST key length");
+    const std::uint8_t type = bytes[position + 4];
+    const std::size_t end = position + kManifestRecordHeader + length + kChecksum;
+    if (crc32(bytes.data() + position + 4, 1 + length) !=
+        read_u32(bytes.data() + end - kChecksum)) {
+      // Only the very last record may be a torn append. A bad record with
+      // valid records after it means the file is damaged, and trusting a
+      // prefix could treat newer live tables as orphans and delete them.
+      if (first || end != size) {
+        throw std::runtime_error("MANIFEST is corrupt");
+      }
+      manifest.needs_rewrite = true;
+      break;
     }
-    out.assign(reinterpret_cast<const char*>(bytes.data() + position), length);
-    position += length;
-  };
-  for (std::uint32_t index = 0; index < count; ++index) {
-    if (limit - position < 12) {
-      throw std::runtime_error("truncated MANIFEST");
+    ManifestReader reader{bytes.data() + position + kManifestRecordHeader,
+                          length};
+    const std::uint64_t next_generation = reader.u64();
+    if (type == kManifestSnapshot) {
+      manifest.tables.clear();
+      const std::uint32_t count = reader.u32();
+      for (std::uint32_t index = 0; index < count; ++index) {
+        ManifestTable table = reader.entry();
+        if (!manifest.tables.emplace(table.generation, table).second) {
+          throw std::runtime_error("MANIFEST lists a table twice");
+        }
+      }
+      manifest.snapshot_bytes = end;
+    } else if (type == kManifestEdit && !first) {
+      const std::uint32_t removed = reader.u32();
+      for (std::uint32_t index = 0; index < removed; ++index) {
+        if (manifest.tables.erase(reader.u64()) == 0) {
+          throw std::runtime_error("MANIFEST edit removes an unknown table");
+        }
+      }
+      const std::uint32_t added = reader.u32();
+      for (std::uint32_t index = 0; index < added; ++index) {
+        ManifestTable table = reader.entry();
+        if (!manifest.tables.emplace(table.generation, table).second) {
+          throw std::runtime_error("MANIFEST edit adds a table twice");
+        }
+      }
+    } else {
+      throw std::runtime_error("invalid MANIFEST record type");
     }
-    ManifestTable table;
-    table.generation = read_u64(bytes.data() + position);
-    table.level = read_u32(bytes.data() + position + 8);
-    position += 12;
-    take_key(table.smallest);
-    take_key(table.largest);
-    if (table.generation == 0 || table.level >= kMaxLevels) {
-      throw std::runtime_error("invalid MANIFEST table entry");
+    if (reader.position != length) {
+      throw std::runtime_error("unexpected bytes in MANIFEST record");
     }
-    manifest.tables.push_back(std::move(table));
+    manifest.next_generation = next_generation;
+    first = false;
+    position = end;
   }
-  if (position != limit) {
-    throw std::runtime_error("unexpected bytes after MANIFEST entries");
+  if (first) {
+    throw std::runtime_error("MANIFEST has no snapshot");
   }
   return manifest;
 }
@@ -934,6 +1082,10 @@ LSMTree::LSMTree(std::filesystem::path directory, Options options)
       ::close(wal_fd_);
       wal_fd_ = -1;
     }
+    if (manifest_fd_ >= 0) {
+      ::close(manifest_fd_);
+      manifest_fd_ = -1;
+    }
     ::close(lock_fd_);
     lock_fd_ = -1;
     throw;
@@ -943,6 +1095,9 @@ LSMTree::LSMTree(std::filesystem::path directory, Options options)
 LSMTree::~LSMTree() {
   if (wal_fd_ >= 0) {
     ::close(wal_fd_);
+  }
+  if (manifest_fd_ >= 0) {
+    ::close(manifest_fd_);
   }
   if (lock_fd_ >= 0) {
     ::close(lock_fd_);  // Releases the flock.
@@ -1003,7 +1158,7 @@ void LSMTree::open_tables() {
     // The MANIFEST alone decides which tables are live.
     next_generation_ = std::max(next_generation_, manifest->next_generation);
     std::set<std::uint64_t> live;
-    for (const auto& entry : manifest->tables) {
+    for (const auto& [listed, entry] : manifest->tables) {
       const auto file = files.find(entry.generation);
       if (file == files.end()) {
         throw std::runtime_error("MANIFEST references missing table sst-" +
@@ -1066,38 +1221,45 @@ void LSMTree::open_tables() {
       sequence_ = std::max(sequence_, table->max_sequence);
     }
   }
-  if (!manifest) {
-    write_manifest(levels_);
+  if (!manifest || manifest->needs_rewrite) {
+    rewrite_manifest();
+  } else {
+    const auto path = directory_ / "MANIFEST";
+    manifest_fd_ = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (manifest_fd_ < 0) {
+      system_error("open MANIFEST");
+    }
+    manifest_bytes_ = std::filesystem::file_size(path);
+    manifest_snapshot_bytes_ = manifest->snapshot_bytes;
   }
 }
 
-// Atomically replaces MANIFEST: write MANIFEST.tmp, fsync, rename, fsync the
-// directory. A failure before the rename leaves the old MANIFEST in force;
-// a failure after it leaves the outcome unknown, so writes are refused until
-// the database is reopened.
-void LSMTree::write_manifest(const Levels& levels) {
+// Writes the current levels as a fresh single-snapshot MANIFEST: write
+// MANIFEST.tmp, fsync, rename, fsync the directory. A failure before the
+// rename leaves the old MANIFEST in force; a failure after it leaves the
+// outcome unknown, so writes are refused until the database is reopened.
+void LSMTree::rewrite_manifest() {
+  std::vector<std::uint8_t> payload;
+  append_u64(payload, next_generation_);
+  std::uint32_t count = 0;
+  for (const auto& tables : levels_) {
+    count += static_cast<std::uint32_t>(tables.size());
+  }
+  append_u32(payload, count);
+  for (std::size_t level = 0; level < levels_.size(); ++level) {
+    for (const auto& table : levels_[level]) {
+      append_manifest_entry(payload, table->generation, level, table->smallest,
+                            table->largest);
+    }
+  }
   std::vector<std::uint8_t> bytes;
   append_u32(bytes, kManifestMagic);
   append_u32(bytes, kManifestVersion);
-  append_u64(bytes, next_generation_);
-  std::uint32_t count = 0;
-  for (const auto& tables : levels) {
-    count += static_cast<std::uint32_t>(tables.size());
-  }
-  append_u32(bytes, count);
-  for (std::size_t level = 0; level < levels.size(); ++level) {
-    for (const auto& table : levels[level]) {
-      append_u64(bytes, table->generation);
-      append_u32(bytes, static_cast<std::uint32_t>(level));
-      append_u32(bytes, static_cast<std::uint32_t>(table->smallest.size()));
-      bytes.insert(bytes.end(), table->smallest.begin(), table->smallest.end());
-      append_u32(bytes, static_cast<std::uint32_t>(table->largest.size()));
-      bytes.insert(bytes.end(), table->largest.begin(), table->largest.end());
-    }
-  }
-  append_u32(bytes, crc32(bytes.data(), bytes.size()));
+  const auto record = manifest_record(kManifestSnapshot, payload);
+  bytes.insert(bytes.end(), record.begin(), record.end());
 
   const auto temporary = directory_ / "MANIFEST.tmp";
+  const auto manifest = directory_ / "MANIFEST";
   const auto fail = [&](const char* operation) {
     const int saved = errno;
     std::error_code ignored;
@@ -1127,14 +1289,100 @@ void LSMTree::write_manifest(const Levels& levels) {
   if (::close(fd) != 0) {
     fail("close MANIFEST");
   }
-  if (::rename(temporary.c_str(), (directory_ / "MANIFEST").c_str()) != 0) {
+  if (::rename(temporary.c_str(), manifest.c_str()) != 0) {
     fail("rename MANIFEST");
   }
   try {
     sync_directory();
+    if (manifest_fd_ >= 0) {
+      ::close(manifest_fd_);
+    }
+    manifest_fd_ = ::open(manifest.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (manifest_fd_ < 0) {
+      system_error("open MANIFEST");
+    }
   } catch (...) {
     failed_ = true;
     throw;
+  }
+  manifest_bytes_ = bytes.size();
+  manifest_snapshot_bytes_ = bytes.size();
+}
+
+// Makes `next` the live set of tables by appending one edit record (tables
+// removed, tables added or moved to another level) and fsyncing it. The edit
+// is the commit point: before its fsync the old tables are live, after it the
+// new ones are.
+void LSMTree::commit(Levels next) {
+  std::map<std::uint64_t, std::size_t> before;
+  for (std::size_t level = 0; level < levels_.size(); ++level) {
+    for (const auto& table : levels_[level]) {
+      before[table->generation] = level;
+    }
+  }
+  std::map<std::uint64_t, std::size_t> after;
+  for (std::size_t level = 0; level < next.size(); ++level) {
+    for (const auto& table : next[level]) {
+      after[table->generation] = level;
+    }
+  }
+  std::vector<std::uint8_t> removed;
+  std::uint32_t removed_count = 0;
+  for (const auto& [generation, level] : before) {
+    const auto found = after.find(generation);
+    if (found == after.end() || found->second != level) {
+      append_u64(removed, generation);
+      ++removed_count;
+    }
+  }
+  std::vector<std::uint8_t> added;
+  std::uint32_t added_count = 0;
+  for (std::size_t level = 0; level < next.size(); ++level) {
+    for (const auto& table : next[level]) {
+      const auto found = before.find(table->generation);
+      if (found == before.end() || found->second != level) {
+        append_manifest_entry(added, table->generation, level, table->smallest,
+                              table->largest);
+        ++added_count;
+      }
+    }
+  }
+  std::vector<std::uint8_t> payload;
+  append_u64(payload, next_generation_);
+  append_u32(payload, removed_count);
+  payload.insert(payload.end(), removed.begin(), removed.end());
+  append_u32(payload, added_count);
+  payload.insert(payload.end(), added.begin(), added.end());
+  const auto record = manifest_record(kManifestEdit, payload);
+
+  try {
+    write_all(manifest_fd_, record.data(), record.size());
+  } catch (...) {
+    // As with the WAL: a partial record must not stay in the log, or every
+    // later edit would sit behind an unreadable one.
+    if (::ftruncate(manifest_fd_, static_cast<off_t>(manifest_bytes_)) != 0) {
+      failed_ = true;
+    }
+    throw;
+  }
+  if (::fsync(manifest_fd_) != 0) {
+    failed_ = true;
+    system_error("fsync MANIFEST");
+  }
+  manifest_bytes_ += record.size();
+  levels_ = std::move(next);
+
+  if (manifest_bytes_ >= kManifestRewriteBytes &&
+      manifest_bytes_ > 4 * manifest_snapshot_bytes_) {
+    try {
+      rewrite_manifest();
+    } catch (...) {
+      // The edit above is already committed. A rewrite that failed before
+      // its rename left the complete old log in place, so carry on.
+      if (failed_) {
+        throw;
+      }
+    }
   }
 }
 
@@ -1377,8 +1625,7 @@ void LSMTree::flush() {
   next[0].insert(next[0].begin(), std::move(table));
   // The table is live once the MANIFEST lists it; only then may the WAL that
   // also holds its data be discarded.
-  write_manifest(next);
-  levels_ = std::move(next);
+  commit(std::move(next));
   reset_wal();
   memtable_.clear();
   memtable_size_ = 0;
@@ -1506,8 +1753,7 @@ void LSMTree::compact_level(std::size_t level) {
                                return left->smallest < right->smallest;
                              }),
             table);
-  write_manifest(next);
-  levels_ = std::move(next);
+  commit(std::move(next));
   table->level = level + 1;
 }
 
@@ -1666,8 +1912,7 @@ void LSMTree::run_compaction(const std::vector<std::shared_ptr<Table>>& inputs,
   std::sort(level.begin(), level.end(), [](const auto& left, const auto& right) {
     return left->smallest < right->smallest;
   });
-  write_manifest(next);
-  levels_ = std::move(next);
+  commit(std::move(next));
 
   // The inputs are no longer live. A file that fails to delete is an orphan
   // and is removed on the next open.

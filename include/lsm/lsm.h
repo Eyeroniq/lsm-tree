@@ -79,7 +79,8 @@ class LSMTree {
               bool tombstone);
   void acquire_lock();
   void open_tables();
-  void write_manifest(const Levels& levels);
+  void commit(Levels next);
+  void rewrite_manifest();
   void recover_wal();
   std::filesystem::path table_path(std::uint64_t generation,
                                    bool temporary) const;
@@ -100,6 +101,11 @@ class LSMTree {
   int wal_fd_ = -1;
   // Holds an exclusive flock on <directory>/LOCK for the object's lifetime.
   int lock_fd_ = -1;
+  // Append-only MANIFEST log: open for appending edits, its size, and the
+  // size of the snapshot it starts with (to decide when to rewrite it).
+  int manifest_fd_ = -1;
+  std::uint64_t manifest_bytes_ = 0;
+  std::uint64_t manifest_snapshot_bytes_ = 0;
   // Byte length of the WAL up to the end of its last complete record.
   std::uint64_t wal_size_ = 0;
   // Set when an I/O error leaves the on-disk state uncertain; all further

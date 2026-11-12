@@ -759,6 +759,191 @@ void test_damaged_manifest_is_rejected() {
   reset(directory);
 }
 
+std::string read_file(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  return std::string((std::istreambuf_iterator<char>(input)),
+                     std::istreambuf_iterator<char>());
+}
+
+void write_file(const std::filesystem::path& path, const std::string& bytes) {
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+}
+
+std::uint32_t get_u32(const std::string& bytes, std::size_t offset) {
+  std::uint32_t value = 0;
+  for (int index = 3; index >= 0; --index) {
+    value = (value << 8) | static_cast<unsigned char>(bytes[offset + index]);
+  }
+  return value;
+}
+
+// Offsets of each record in a version 2 MANIFEST.
+std::vector<std::size_t> manifest_records(const std::string& bytes) {
+  std::vector<std::size_t> offsets;
+  std::size_t position = 8;
+  while (position + 9 <= bytes.size()) {
+    offsets.push_back(position);
+    position += 5 + get_u32(bytes, position) + 4;
+  }
+  return offsets;
+}
+
+void test_manifest_appends_edits() {
+  const auto directory = test_directory("manifest-log");
+  reset(directory);
+  lsm::Options options;
+  options.compaction_trigger = 10;
+  const auto manifest = directory / "MANIFEST";
+  {
+    lsm::LSMTree database(directory, options);
+    std::uintmax_t previous = std::filesystem::file_size(manifest);
+    for (int round = 0; round < 5; ++round) {
+      database.put(numbered("key-", round), "value");
+      database.flush();
+      const auto size = std::filesystem::file_size(manifest);
+      // One small edit is appended per flush; nothing is rewritten.
+      CHECK(size > previous);
+      CHECK(size - previous < 100);
+      previous = size;
+    }
+  }
+  const std::string bytes = read_file(manifest);
+  CHECK(get_u32(bytes, 0) == 0x324E414DU);  // MAN2
+  CHECK(manifest_records(bytes).size() == 6);  // snapshot + five edits
+  lsm::LSMTree database(directory, options);
+  CHECK(database.stats().sstable_count == 5);
+  CHECK(database.get("key-0004") == std::optional<std::string>("value"));
+  reset(directory);
+}
+
+void test_manifest_log_stays_bounded() {
+  const auto directory = test_directory("manifest-bounded");
+  reset(directory);
+  auto options = small_options();
+  options.sync_writes = false;
+  std::uintmax_t largest = 0;
+  {
+    lsm::LSMTree database(directory, options);
+    for (int index = 0; index < 6000; ++index) {
+      database.put(numbered("bounded-", index % 900), std::to_string(index));
+      largest = std::max(largest, std::filesystem::file_size(directory / "MANIFEST"));
+    }
+  }
+  // Thousands of edits, but the log is rewritten as a snapshot once it is
+  // well past 64 KiB.
+  CHECK(largest < 256 * 1024);
+  lsm::LSMTree database(directory, options);
+  for (int index = 5100; index < 6000; ++index) {
+    CHECK(database.get(numbered("bounded-", index % 900)) ==
+          std::optional<std::string>(std::to_string(index)));
+  }
+  reset(directory);
+}
+
+void test_torn_manifest_tail_is_ignored() {
+  const auto directory = test_directory("manifest-torn");
+  reset(directory);
+  lsm::Options options;
+  options.compaction_trigger = 10;
+  {
+    lsm::LSMTree database(directory, options);
+    database.put("a", "1");
+    database.flush();
+    database.put("b", "2");
+    database.flush();
+  }
+  const auto manifest = directory / "MANIFEST";
+  const std::string clean = read_file(manifest);
+  for (int variant = 0; variant < 2; ++variant) {
+    std::string damaged = clean;
+    if (variant == 0) {
+      // An append cut short: the header promises more bytes than exist.
+      put_u32(damaged, 200);
+      damaged += "\x02partial";
+    } else {
+      // A complete final record whose checksum does not match.
+      std::string payload(30, 'x');
+      put_u32(damaged, static_cast<std::uint32_t>(payload.size()));
+      damaged += '\x02';
+      damaged += payload;
+      put_u32(damaged, 0xDEADBEEFU);
+    }
+    write_file(manifest, damaged);
+    {
+      lsm::LSMTree database(directory, options);
+      CHECK(database.get("a") == std::optional<std::string>("1"));
+      CHECK(database.get("b") == std::optional<std::string>("2"));
+      CHECK(database.stats().sstable_count == 2);
+    }
+    // The uncommitted edit is gone; the log was rewritten cleanly.
+    CHECK(read_file(manifest).size() < damaged.size());
+  }
+  reset(directory);
+}
+
+void test_corrupt_manifest_record_before_tail_fails_open() {
+  const auto directory = test_directory("manifest-middle");
+  reset(directory);
+  lsm::Options options;
+  options.compaction_trigger = 10;
+  {
+    lsm::LSMTree database(directory, options);
+    for (int round = 0; round < 3; ++round) {
+      database.put(numbered("key-", round), "value");
+      database.flush();
+    }
+  }
+  const auto manifest = directory / "MANIFEST";
+  std::string bytes = read_file(manifest);
+  const auto records = manifest_records(bytes);
+  CHECK(records.size() == 4);
+  // Damage the first edit; two valid edits follow it. Treating this as a
+  // torn tail would drop the later tables and delete them as orphans.
+  bytes[records[1] + 9] ^= 0x5A;
+  write_file(manifest, bytes);
+  bool rejected = false;
+  try {
+    lsm::LSMTree database(directory, options);
+  } catch (const std::runtime_error&) {
+    rejected = true;
+  }
+  CHECK(rejected);
+  CHECK(table_files(directory).size() == 3);  // Nothing was deleted.
+  reset(directory);
+}
+
+void test_version1_manifest_is_upgraded() {
+  const auto directory = test_directory("manifest-v1");
+  reset(directory);
+  {
+    lsm::LSMTree database(directory);
+    database.put("k", "v");
+    database.flush();
+  }
+  // The single-snapshot format written by the previous release.
+  std::string bytes;
+  put_u32(bytes, 0x314E414DU);  // MAN1
+  put_u32(bytes, 1);
+  put_u64(bytes, 2);  // next generation
+  put_u32(bytes, 1);  // one table
+  put_u64(bytes, 1);  // generation
+  put_u32(bytes, 0);  // level
+  put_u32(bytes, 1);
+  bytes += "k";
+  put_u32(bytes, 1);
+  bytes += "k";
+  put_u32(bytes, lsm::crc32(reinterpret_cast<const std::uint8_t*>(bytes.data()),
+                            bytes.size()));
+  write_file(directory / "MANIFEST", bytes);
+  {
+    lsm::LSMTree database(directory);
+    CHECK(database.get("k") == std::optional<std::string>("v"));
+  }
+  CHECK(get_u32(read_file(directory / "MANIFEST"), 0) == 0x324E414DU);
+  reset(directory);
+}
+
 }  // namespace
 
 int main() {
@@ -783,6 +968,11 @@ int main() {
   test_manifest_decides_which_tables_are_live();
   test_directory_without_manifest_is_migrated();
   test_damaged_manifest_is_rejected();
+  test_manifest_appends_edits();
+  test_manifest_log_stays_bounded();
+  test_torn_manifest_tail_is_ignored();
+  test_corrupt_manifest_record_before_tail_fails_open();
+  test_version1_manifest_is_upgraded();
   if (failures != 0) {
     std::cerr << failures << " of " << assertions << " assertions failed\n";
     return 1;
