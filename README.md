@@ -421,6 +421,27 @@ db.compact();                // everything into the deepest level
 db.wait_for_compactions();   // until no background work is pending
 ```
 
+## Live dashboard
+
+```bash
+make demo                    # http://localhost:8080
+make demo DEMO_PORT=18080    # if port 8080 is taken
+```
+
+`make demo` starts the HTTP service on a fresh database with deliberately
+tiny memtables, tables and levels, and serves a dashboard at the root URL:
+
+- **the tree, live**: the memtable filling up and every level L0-L6 drawn as
+  table chips, so flushes and compactions are visible as they happen;
+- **live counters**: writes, tables, Bloom-filter skip rate, block-cache hit
+  rate and bytes rewritten by compaction, with a writes-per-second sparkline;
+- **an activity feed** narrating each flush, compaction and trivial move;
+- **buttons** to write or read 5,000 random keys, flush and compact, plus a
+  key explorer and a prefix range scan.
+
+It is plain HTML, CSS and JavaScript served by the same Spring Boot app, with
+no build step and nothing loaded from the network, in dark and light themes.
+
 ## HTTP service (Spring Boot)
 
 `server/` is a Spring Boot 4 application on Java 25 that serves the engine over
@@ -442,7 +463,8 @@ make server        # http://localhost:8080
 | `DELETE` | `/api/v1/kv/{key}` | delete a key |
 | `GET` | `/api/v1/kv?from=&to=&limit=` | scan `[from, to)` as JSON |
 | `POST` | `/api/v1/admin/flush`, `/api/v1/admin/compact` | maintenance |
-| `GET` | `/api/v1/admin/stats` | engine counters |
+| `GET` | `/api/v1/admin/stats` | engine counters, including tables per level |
+| `POST` | `/api/v1/demo/load?count=`, `/api/v1/demo/read?count=` | random load for the dashboard |
 
 Interactive docs are at `/swagger-ui.html`, health at `/actuator/health`, and
 the engine counters are published as Micrometer metrics (`lsm.sstables`,
@@ -456,7 +478,9 @@ directory. Keys and values are treated as UTF-8 text at the HTTP layer.
 
 Settings bind from `application.properties` or environment variables:
 `LSM_DATA_DIR`, `LSM_LIBRARY_PATH`, `LSM_MEMTABLE_BYTES`,
-`LSM_COMPACTION_TRIGGER`, `LSM_SYNC_WRITES`.
+`LSM_COMPACTION_TRIGGER`, `LSM_TABLE_BYTES`, `LSM_LEVEL1_BYTES`,
+`LSM_SYNC_WRITES`. The `demo` profile (`application-demo.properties`) sets
+tiny sizes for the dashboard.
 
 ```bash
 docker build -t lsm-tree-server .
@@ -485,6 +509,7 @@ scripts/powercut/          LD_PRELOAD fsync shim for simulated power loss
 scripts/powercut_torture.py  power-cut campaign
 bindings/lsm_c.h           C ABI over the engine for foreign callers
 server/                    Spring Boot HTTP service (Java 25, FFM)
+server/.../static/         the live dashboard (HTML, CSS, JavaScript)
 Dockerfile                 engine library + service in one image
 .github/workflows/ci.yml   engine, sanitizer, power-cut, Java and Docker jobs
 ```

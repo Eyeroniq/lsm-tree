@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>lsm-tree — bash</title>
+  <style>
+    :root {
+      --bg: #0a0d16;
+      --bar: #10141f;
+      --text: #d6dbe8;
+      --muted: #6d7690;
+      --green: #4ade80;
+      --red: #fb7185;
+      --cyan: #22d3ee;
+      --violet: #a78bfa;
+      --yellow: #fde047;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      display: flex; flex-direction: column;
+      background:
+        radial-gradient(900px 500px at 0% 0%, rgba(139, 92, 246, .10), transparent 60%),
+        radial-gradient(800px 500px at 100% 100%, rgba(34, 211, 238, .07), transparent 60%),
+        var(--bg);
+      color: var(--text);
+      font: 16px/1.55 "Cascadia Mono", "Cascadia Code", Consolas, ui-monospace, monospace;
+    }
+    .bar {
+      display: flex; align-items: center; gap: 8px; flex: none;
+      height: 42px; padding: 0 16px; background: var(--bar);
+      border-bottom: 1px solid rgba(255, 255, 255, .06);
+      font: 600 13px "Segoe UI", system-ui, sans-serif; color: var(--muted);
+    }
+    .bar i { width: 12px; height: 12px; border-radius: 50%; display: inline-block; }
+    .bar i:nth-child(1) { background: #ff5f57; }
+    .bar i:nth-child(2) { background: #febc2e; }
+    .bar i:nth-child(3) { background: #28c840; }
+    .bar span { margin-left: 14px; }
+    #screen { flex: 1; overflow: hidden; padding: 18px 24px 24px; display: flex; flex-direction: column; justify-content: flex-end; }
+    #lines { white-space: pre-wrap; word-break: break-word; }
+    .line { min-height: 1.55em; }
+    .prompt-user { color: var(--green); font-weight: 600; }
+    .prompt-path { color: var(--cyan); font-weight: 600; }
+    .typed { color: #ffffff; }
+    .win {
+      color: var(--green); font-weight: 600;
+      text-shadow: 0 0 14px rgba(74, 222, 128, .45);
+    }
+    .bad { color: var(--red); font-weight: 600; }
+    .dim { opacity: .55; }
+    .b { font-weight: 700; }
+    .c31 { color: var(--red); } .c32 { color: var(--green); } .c33 { color: var(--yellow); }
+    .c35 { color: var(--violet); } .c36 { color: var(--cyan); }
+    #input-line { display: flex; }
+    #input { flex: 1; min-width: 0; border: 0; outline: 0; padding: 0; background: transparent; color: #fff; font: inherit; caret-color: transparent; }
+    #caret { display: inline-block; width: .6em; height: 1.2em; margin-left: 1px; transform: translateY(.2em); background: #e5e7eb; animation: blink 1.05s steps(1) infinite; }
+    #typed { white-space: pre; color: #fff; }
+    .running #caret { opacity: 0; animation: none; }
+    /* Like a real shell: no prompt until the command has finished. */
+    .running #input-line { visibility: hidden; }
+    @keyframes blink { 50% { opacity: 0; } }
+  </style>
+</head>
+<body>
+  <div class="bar"><i></i><i></i><i></i><span>demo@lsm-tree: ~/lsm-tree</span></div>
+  <div id="screen">
+    <div id="lines"></div>
+    <label id="input-line">
+      <span><span class="prompt-user">demo@lsm-tree</span>:<span class="prompt-path">~/lsm-tree</span>$&nbsp;</span>
+      <span id="typed"></span><span id="caret"></span>
+      <input id="input" autocomplete="off" spellcheck="false" aria-label="command"
+             style="position:absolute; opacity:0; width:1px; height:1px;">
+    </label>
+  </div>
+  <script>
+    const lines = document.getElementById("lines");
+    const input = document.getElementById("input");
+    const typed = document.getElementById("typed");
+    const MAX_LINES = 400;
+    // Lines worth noticing in the output, highlighted as results.
+    const WIN = /(\d+ assertions passed|"acknowledged_losses": 0|✔|BUILD SUCCESS|read_ops_per_second)/;
+    const BAD = /(✘|lost data|lost acknowledged|FAIL|Error)/;
+
+    document.addEventListener("click", () => input.focus());
+    input.addEventListener("input", () => { typed.textContent = input.value; });
+    input.focus();
+
+    function ansi(text) {
+      // Minimal SGR support: bold, dim and the colours the demo script uses.
+      const fragment = document.createDocumentFragment();
+      let classes = [];
+      for (const part of text.split(/(\x1b\[[0-9;]*m)/)) {
+        const sgr = /^\x1b\[([0-9;]*)m$/.exec(part);
+        if (sgr) {
+          for (const code of (sgr[1] || "0").split(";").map(Number)) {
+            if (code === 0) classes = [];
+            else if (code === 1) classes.push("b");
+            else if (code === 2) classes.push("dim");
+            else if (code >= 30 && code <= 37) classes.push(`c${code}`);
+          }
+          continue;
+        }
+        if (!part) continue;
+        const span = document.createElement("span");
+        span.className = classes.join(" ");
+        span.textContent = part;
+        fragment.appendChild(span);
+      }
+      return fragment;
+    }
+
+    function addLine(content, className) {
+      const line = document.createElement("div");
+      line.className = `line ${className || ""}`;
+      if (typeof content === "string") {
+        const plain = content.replace(/\x1b\[[0-9;]*m/g, "");
+        if (WIN.test(plain)) line.classList.add("win");
+        else if (BAD.test(plain)) line.classList.add("bad");
+        line.appendChild(ansi(content));
+      } else {
+        line.appendChild(content);
+      }
+      lines.appendChild(line);
+      while (lines.children.length > MAX_LINES) lines.firstChild.remove();
+    }
+
+    function echoCommand(command) {
+      const fragment = document.createDocumentFragment();
+      const user = document.createElement("span");
+      user.className = "prompt-user"; user.textContent = "demo@lsm-tree";
+      const path = document.createElement("span");
+      path.className = "prompt-path"; path.textContent = "~/lsm-tree";
+      const text = document.createElement("span");
+      text.className = "typed"; text.textContent = command;
+      fragment.append(user, ":", path, "$ ", text);
+      addLine(fragment);
+    }
+
+    window.term = {
+      clear() { lines.replaceChildren(); },
+      running: false,
+      lastExit: null,
+    };
+
+    input.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || window.term.running) return;
+      const command = input.value.trim();
+      input.value = ""; typed.textContent = "";
+      echoCommand(command);
+      if (!command) return;
+      if (command === "clear") { window.term.clear(); return; }
+      window.term.running = true;
+      window.term.lastExit = null;
+      document.body.classList.add("running");
+      const source = new EventSource(`/run?cmd=${encodeURIComponent(command)}`);
+      source.addEventListener("line", (message) => addLine(JSON.parse(message.data)));
+      source.addEventListener("exit", (message) => {
+        source.close();
+        window.term.lastExit = Number(JSON.parse(message.data));
+        window.term.running = false;
+        document.body.classList.remove("running");
+      });
+      source.onerror = () => {
+        source.close();
+        if (window.term.running) {
+          addLine("connection to the demo terminal lost", "bad");
+          window.term.lastExit = -1;
+          window.term.running = false;
+          document.body.classList.remove("running");
+        }
+      };
+    });
+  </script>
+</body>
+</html>

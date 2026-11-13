@@ -80,7 +80,8 @@ extern "C" {
 
 int lsm_open(const char* path, uint64_t memtable_bytes,
              uint64_t bloom_bits_per_key, uint64_t compaction_trigger,
-             int sync_writes, lsm_db** out, char** error) {
+             uint64_t table_bytes, uint64_t level1_bytes, int sync_writes,
+             lsm_db** out, char** error) {
   return guarded(error, [&] {
     if (path == nullptr || out == nullptr) {
       throw std::invalid_argument("path and out must not be null");
@@ -89,6 +90,12 @@ int lsm_open(const char* path, uint64_t memtable_bytes,
     options.memtable_bytes = static_cast<std::size_t>(memtable_bytes);
     options.bloom_bits_per_key = static_cast<std::size_t>(bloom_bits_per_key);
     options.compaction_trigger = static_cast<std::size_t>(compaction_trigger);
+    if (table_bytes != 0) {
+      options.table_bytes = static_cast<std::size_t>(table_bytes);
+    }
+    if (level1_bytes != 0) {
+      options.level1_bytes = static_cast<std::size_t>(level1_bytes);
+    }
     options.sync_writes = sync_writes != 0;
     *out = new lsm_db(path, options);
     return LSM_OK;
@@ -170,6 +177,13 @@ void lsm_get_stats(lsm_db* db, lsm_stats* out) {
   out->sequence = stats.sequence;
   out->bloom_checks = stats.bloom_checks;
   out->bloom_negative_hits = stats.bloom_negative_hits;
+  out->block_reads = stats.block_reads;
+  out->block_cache_hits = stats.block_cache_hits;
+  out->compaction_bytes_written = stats.compaction_bytes_written;
+  for (std::size_t level = 0; level < LSM_MAX_LEVELS; ++level) {
+    out->tables_per_level[level] =
+        level < stats.tables_per_level.size() ? stats.tables_per_level[level] : 0;
+  }
 }
 
 void lsm_free(void* pointer) { std::free(pointer); }

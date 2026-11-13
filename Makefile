@@ -24,7 +24,7 @@ endif
 PIC_DIR := $(BUILD_DIR)/pic
 SHARED_LIB := $(BUILD_DIR)/liblsm.$(SHARED_EXT)
 
-.PHONY: all shared test asan-test tsan-test crash-test powercut-test benchmark java-test server smoke-test clean
+.PHONY: all shared test asan-test tsan-test crash-test powercut-test benchmark java-test server demo smoke-test clean
 
 all: $(TOOL)
 
@@ -99,6 +99,14 @@ java-test: $(SHARED_LIB)
 
 server: $(SHARED_LIB)
 	cd server && mvn -B -q spring-boot:run
+
+# Dashboard demo on a fresh database with tiny levels, at
+# http://localhost:$(DEMO_PORT) (e.g. `make demo DEMO_PORT=8090`).
+DEMO_PORT ?= 8080
+demo: $(SHARED_LIB)
+	rm -rf server/demo-data
+	cd server && mvn -B -q spring-boot:run -Dspring-boot.run.profiles=demo \
+		-Dspring-boot.run.arguments=--server.port=$(DEMO_PORT)
 
 smoke-test:
 	docker build -t lsm-tree-server .

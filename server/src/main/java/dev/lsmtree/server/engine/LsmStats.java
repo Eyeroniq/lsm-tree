@@ -6,4 +6,12 @@ public record LsmStats(
     long sstableCount,
     long sequence,
     long bloomChecks,
-    long bloomNegativeHits) {}
+    long bloomNegativeHits,
+    long blockReads,
+    long blockCacheHits,
+    long compactionBytesWritten,
+    long[] tablesPerLevel) {
+
+  /** Levels reported by the engine (L0 to L6). */
+  public static final int MAX_LEVELS = 7;
+}

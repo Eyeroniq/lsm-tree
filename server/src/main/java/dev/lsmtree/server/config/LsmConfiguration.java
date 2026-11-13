@@ -22,7 +22,7 @@ public class LsmConfiguration {
   LsmStore lsmStore(LsmProperties properties) {
     LsmOptions options = new LsmOptions(properties.memtableBytes(),
         properties.bloomBitsPerKey(), properties.compactionTrigger(),
-        properties.syncWrites());
+        properties.tableBytes(), properties.level1Bytes(), properties.syncWrites());
     return LsmStore.open(resolveLibrary(properties.libraryPath()),
         properties.dataDir(), options);
   }
